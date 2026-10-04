@@ -1,0 +1,6 @@
+.venv
+build
+__pycache__
+dist
+loa.spec
+.DS_Store

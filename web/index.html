@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>LOA</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <main class="app-shell">
+    <header class="topbar">
+      <h1 id="app-title">LoaApp</h1>
+    </header>
+
+    <section id="login-panel" class="login-panel" hidden>
+      <h2>Web login</h2>
+      <p class="login-copy">Enter the password saved for LOA on your Mac.</p>
+      <form id="login-form">
+        <label class="visually-hidden" for="web-password">Web password</label>
+        <input id="web-password" type="password" autocomplete="current-password"
+          placeholder="Web password" required>
+        <button class="primary-button" type="submit">Continue</button>
+      </form>
+      <p id="login-status" class="status" aria-live="polite"></p>
+    </section>
+
+    <section id="settings-panel" class="settings-panel" hidden>
+      <div class="section-heading">
+        <div>
+          <p class="eyebrow">PREFERENCES</p>
+          <h2 id="settings-heading">Assistant settings</h2>
+        </div>
+        <button id="settings-close" class="quiet-button" type="button">Close</button>
+      </div>
+      <form id="settings-form">
+        <label for="assistant-name">Assistant name</label>
+        <input id="assistant-name" name="name" autocomplete="off" required>
+        <label for="model-name">Ollama model</label>
+        <input id="model-name" name="model" autocomplete="off" required>
+        <label for="system-prompt">System prompt</label>
+        <textarea id="system-prompt" name="prompt" rows="7" required></textarea>
+        <button class="primary-button" type="submit">Save settings</button>
+        <p id="settings-status" class="status" aria-live="polite"></p>
+      </form>
+    </section>
+
+    <section id="chat-panel" class="chat-panel" aria-label="Chat" hidden>
+      <div id="status-line" class="status-line">LOA</div>
+      <div id="messages" class="messages" aria-live="polite"></div>
+      <form id="chat-form" class="chat-form">
+        <label class="visually-hidden" for="message-input">Message</label>
+        <textarea id="message-input" rows="1" placeholder="Message LOA" required></textarea>
+      </form>
+      <div id="chat-controls" class="chat-controls">
+        <button id="send-button" class="primary-button" type="submit" form="chat-form">Send</button>
+        <button id="voice-button" class="quiet-button voice-button" type="button"
+          aria-label="Start voice input" title="Speak your message">Speak</button>
+        <button id="settings-toggle" class="quiet-button" type="button" hidden>Settings</button>
+        <button id="logout-button" class="quiet-button" type="button" hidden>Exit</button>
+      </div>
+      <div id="command-controls" class="command-controls" hidden>
+        <button id="approve-command" class="primary-button" type="button">Run command</button>
+        <button id="cancel-command" class="quiet-button" type="button">Cancel command</button>
+      </div>
+      <p id="connection-status" class="status" aria-live="polite"></p>
+    </section>
+  </main>
+</body>
+</html>

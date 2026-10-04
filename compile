@@ -1,0 +1,25 @@
+#!/bin/sh
+set -eu
+
+cd "$(dirname "$0")"
+
+PYTHON=${PYTHON:-python3}
+VENV_DIR=".venv"
+VENV_PYTHON="$VENV_DIR/bin/python"
+
+if [ ! -x "$VENV_PYTHON" ]; then
+    "$PYTHON" -m venv "$VENV_DIR"
+fi
+
+"$VENV_PYTHON" -m pip install -r requirements.txt
+"$VENV_PYTHON" -m PyInstaller \
+    --clean \
+    --onefile \
+    --name loa \
+    --collect-all textual \
+    --collect-all ollama \
+    --collect-all ddgs \
+    --add-data "web:web" \
+    loa.py
+
+printf '\nBuild complete: %s/dist/loa\n' "$(pwd)"

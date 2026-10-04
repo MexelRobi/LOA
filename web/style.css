@@ -1,0 +1,373 @@
+:root {
+  color-scheme: dark;
+  font-family: ui-monospace, "SFMono-Regular", Menlo, Monaco, Consolas, monospace;
+  background: #17191c;
+  color: #e2e5e8;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  --surface: #202327;
+  --border: #30343a;
+  --muted: #8e969f;
+  --button: #c8cdd2;
+  --button-text: #17191c;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  min-width: 320px;
+  min-height: 100vh;
+  min-height: 100svh;
+  margin: 0;
+}
+
+button,
+input,
+textarea {
+  font: inherit;
+}
+
+button {
+  min-height: 36px;
+  padding: 0 12px;
+  border: 1px solid #3a3f46;
+  border-radius: 2px;
+  background: #292d32;
+  color: #e2e5e8;
+  cursor: pointer;
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: wait;
+}
+
+button:focus-visible,
+input:focus-visible,
+textarea:focus-visible {
+  outline: 1px solid #c8cdd2;
+  outline-offset: 1px;
+}
+
+.app-shell {
+  display: flex;
+  width: 100%;
+  height: 100vh;
+  height: 100svh;
+  min-height: 340px;
+  flex-direction: column;
+  padding: 0 1.2vw 1vh;
+}
+
+.topbar {
+  display: flex;
+  min-height: 30px;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 30px;
+}
+
+.topbar h1 {
+  margin: 0;
+  color: #9aa1a9;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-size: 0.82rem;
+  font-weight: 500;
+}
+
+.chat-panel {
+  display: flex;
+  min-height: 0;
+  flex: 1;
+  flex-direction: column;
+  padding: 0 1px 1px;
+  border: 1px solid #454a50;
+  border-radius: 6px;
+  background: #17191c;
+}
+
+.status-line {
+  min-height: 26px;
+  padding: 4px 8px 3px;
+  flex: 0 0 auto;
+  color: #c8cdd2;
+  font-size: 0.79rem;
+}
+
+.messages {
+  display: flex;
+  min-height: 0;
+  flex: 1;
+  flex-direction: column;
+  gap: 0;
+  overflow: auto;
+  padding: 5px 9px;
+  border: 1px solid #30343a;
+  border-radius: 5px;
+  background: #202327;
+  font-size: clamp(0.72rem, 1.05vw, 0.89rem);
+  line-height: 1.55;
+  scrollbar-color: #474c52 #202327;
+}
+
+.message {
+  max-width: 100%;
+  flex: 0 0 auto;
+  align-self: stretch;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.message.user,
+.message.assistant {
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+}
+
+.message.system {
+  color: #d0d4d8;
+}
+
+.sources {
+  display: grid;
+  gap: 2px;
+  padding-left: 1ch;
+  color: var(--muted);
+  font-size: inherit;
+}
+
+.sources a {
+  color: #bfc6cd;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.chat-form {
+  display: flex;
+  min-height: 38px;
+  align-items: center;
+  padding: 5px 4px 0;
+}
+
+input,
+textarea {
+  min-width: 0;
+  padding: 7px 9px;
+  border: 1px solid #3a3f46;
+  border-radius: 2px;
+  background: #17191c;
+  color: #e2e5e8;
+  resize: vertical;
+}
+
+#message-input {
+  min-height: 34px;
+  max-height: 160px;
+  flex: 1;
+  padding: 4px 8px;
+  resize: none;
+}
+
+.chat-controls,
+.command-controls {
+  display: flex;
+  min-height: 36px;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 4px;
+  padding: 1px 4px;
+}
+
+.primary-button {
+  border-color: #c8cdd2;
+  background: #c8cdd2;
+  color: #17191c;
+  font-weight: 700;
+}
+
+.quiet-button {
+  color: #d4d8dc;
+}
+
+.voice-button {
+  min-width: 64px;
+  flex: 0 0 auto;
+}
+
+.voice-button.is-listening {
+  border-color: #c49a9a;
+  background: #382727;
+  color: #f0dada;
+}
+
+.voice-button:disabled {
+  cursor: not-allowed;
+}
+
+.status {
+  min-height: 15px;
+  margin: 0;
+  padding: 0 6px;
+  color: var(--muted);
+  font-size: 0.69rem;
+  overflow-wrap: anywhere;
+}
+
+.settings-panel,
+.login-panel {
+  width: 100%;
+  margin: 2px 0 6px;
+  padding: 9px;
+  border: 1px solid #454a50;
+  border-radius: 3px;
+  background: #202327;
+}
+
+.section-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.section-heading h2,
+.login-panel h2 {
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-size: 0.95rem;
+  font-weight: 600;
+}
+
+.settings-panel form {
+  display: grid;
+  grid-template-columns: minmax(110px, 18%) 1fr;
+  align-items: center;
+  gap: 6px 9px;
+  margin-top: 8px;
+}
+
+.settings-panel label,
+.login-copy {
+  color: #c7cbd0;
+  font-size: 0.76rem;
+}
+
+.settings-panel input,
+.settings-panel textarea {
+  width: 100%;
+  font-size: 0.77rem;
+}
+
+.settings-panel textarea {
+  min-height: 80px;
+  grid-column: 2;
+}
+
+.settings-panel label[for="system-prompt"] {
+  align-self: start;
+  padding-top: 7px;
+}
+
+.settings-panel .primary-button,
+.settings-panel .status {
+  grid-column: 2;
+  justify-self: start;
+}
+
+.settings-panel .status {
+  padding: 0;
+}
+
+.login-panel {
+  width: min(100%, 480px);
+  margin: auto;
+}
+
+.login-copy {
+  margin: 5px 0;
+}
+
+.login-panel form {
+  display: flex;
+  gap: 5px;
+}
+
+.login-panel input {
+  flex: 1;
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  clip-path: inset(50%);
+}
+
+[hidden] {
+  display: none !important;
+}
+
+@media (max-width: 520px) {
+  .app-shell {
+    padding: 0 5px 5px;
+  }
+
+  .topbar {
+    flex-basis: 27px;
+    min-height: 27px;
+  }
+
+  .topbar h1 {
+    font-size: 0.75rem;
+  }
+
+  .status-line {
+    min-height: 24px;
+  }
+
+  .messages {
+    padding: 5px;
+    font-size: 0.72rem;
+  }
+
+  .chat-form {
+    min-height: 38px;
+    padding-right: 2px;
+    padding-left: 2px;
+  }
+
+  .chat-controls button,
+  .command-controls button {
+    min-height: 32px;
+    padding: 0 8px;
+    font-size: 0.7rem;
+  }
+
+  .voice-button {
+    min-width: 48px;
+  }
+
+  #message-input {
+    padding-right: 5px;
+    padding-left: 5px;
+    font-size: 0.72rem;
+  }
+
+  .settings-panel form {
+    grid-template-columns: 1fr;
+  }
+
+  .settings-panel textarea,
+  .settings-panel label[for="system-prompt"],
+  .settings-panel .primary-button,
+  .settings-panel .status {
+    grid-column: 1;
+  }
+}
