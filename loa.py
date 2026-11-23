@@ -50,7 +50,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--certfile",
-        help="TLS certificate file for HTTPS and secure browser microphone access",
+        help="TLS certificate file for HTTPS browser connections",
     )
     parser.add_argument(
         "--keyfile",

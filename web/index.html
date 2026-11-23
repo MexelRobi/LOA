@@ -39,11 +39,40 @@
         <input id="assistant-name" name="name" autocomplete="off" required>
         <label for="model-name">Ollama model</label>
         <input id="model-name" name="model" autocomplete="off" required>
+        <label for="ollama-host">Ollama Host URL</label>
+        <div class="host-actions">
+          <input id="ollama-host" name="ollama_host" type="url"
+            placeholder="http://127.0.0.1:11434" autocomplete="url" required>
+          <button id="reset-host" class="quiet-button" type="button">Reset Host</button>
+        </div>
         <label for="system-prompt">System prompt</label>
         <textarea id="system-prompt" name="prompt" rows="7" required></textarea>
-        <button class="primary-button" type="submit">Save settings</button>
+        <div class="prompt-actions">
+          <button id="reset-prompt" class="quiet-button" type="button">Reset Prompt</button>
+          <button class="primary-button" type="submit">Save settings</button>
+        </div>
         <p id="settings-status" class="status" aria-live="polite"></p>
       </form>
+    </section>
+
+    <section id="chats-panel" class="settings-panel" hidden>
+      <div class="section-heading">
+        <div>
+          <p class="eyebrow">CONVERSATIONS</p>
+          <h2>Chats</h2>
+        </div>
+        <button id="chats-close" class="quiet-button" type="button">Close</button>
+      </div>
+      <div id="saved-chats" class="saved-chats"></div>
+      <label for="chat-title">Rename selected chat</label>
+      <input id="chat-title" autocomplete="off">
+      <div class="chat-manager-actions">
+        <button id="chat-open" class="primary-button" type="button">Open / Switch</button>
+        <button id="chat-new" class="quiet-button" type="button">New Chat</button>
+        <button id="chat-rename" class="quiet-button" type="button">Rename</button>
+        <button id="chat-delete" class="quiet-button" type="button">Delete</button>
+      </div>
+      <p id="chats-status" class="status" aria-live="polite"></p>
     </section>
 
     <section id="chat-panel" class="chat-panel" aria-label="Chat" hidden>
@@ -55,14 +84,13 @@
       </form>
       <div id="chat-controls" class="chat-controls">
         <button id="send-button" class="primary-button" type="submit" form="chat-form">Send</button>
-        <button id="voice-button" class="quiet-button voice-button" type="button"
-          aria-label="Start voice input" title="Speak your message">Speak</button>
+        <button id="chats-toggle" class="quiet-button" type="button" hidden>Chats</button>
         <button id="settings-toggle" class="quiet-button" type="button" hidden>Settings</button>
         <button id="logout-button" class="quiet-button" type="button" hidden>Exit</button>
       </div>
       <div id="command-controls" class="command-controls" hidden>
-        <button id="approve-command" class="primary-button" type="button">Run command</button>
-        <button id="cancel-command" class="quiet-button" type="button">Cancel command</button>
+        <button id="approve-command" class="primary-button" type="button">Run</button>
+        <button id="cancel-command" class="quiet-button" type="button">Cancel</button>
       </div>
       <p id="connection-status" class="status" aria-live="polite"></p>
     </section>

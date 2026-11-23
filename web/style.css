@@ -146,6 +146,29 @@ textarea:focus-visible {
   text-underline-offset: 2px;
 }
 
+.message details {
+  margin: 3px 0;
+  border: 1px solid #3a3f46;
+  border-radius: 3px;
+  background: #1b1e21;
+}
+
+.message details summary {
+  padding: 3px 6px;
+  color: #c8cdd2;
+  cursor: pointer;
+}
+
+.message details pre {
+  max-height: 45vh;
+  overflow: auto;
+  margin: 0;
+  padding: 6px;
+  border-top: 1px solid #30343a;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 .chat-form {
   display: flex;
   min-height: 38px;
@@ -193,21 +216,6 @@ textarea {
   color: #d4d8dc;
 }
 
-.voice-button {
-  min-width: 64px;
-  flex: 0 0 auto;
-}
-
-.voice-button.is-listening {
-  border-color: #c49a9a;
-  background: #382727;
-  color: #f0dada;
-}
-
-.voice-button:disabled {
-  cursor: not-allowed;
-}
-
 .status {
   min-height: 15px;
   margin: 0;
@@ -225,6 +233,38 @@ textarea {
   border: 1px solid #454a50;
   border-radius: 3px;
   background: #202327;
+}
+
+.saved-chats {
+  display: grid;
+  max-height: 45vh;
+  gap: 4px;
+  overflow-y: auto;
+  margin: 8px 0;
+}
+
+.chat-choice {
+  display: grid;
+  min-height: auto;
+  gap: 2px;
+  padding: 6px;
+  text-align: left;
+}
+
+.chat-choice[aria-pressed="true"] {
+  border-color: #c8cdd2;
+}
+
+.chat-choice small {
+  color: var(--muted);
+  white-space: normal;
+}
+
+.chat-manager-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin-top: 6px;
 }
 
 .section-heading {
@@ -265,6 +305,25 @@ textarea {
 .settings-panel textarea {
   min-height: 80px;
   grid-column: 2;
+}
+
+.settings-panel .host-actions {
+  display: flex;
+  grid-column: 2;
+  gap: 5px;
+  min-width: 0;
+}
+
+.settings-panel .host-actions input {
+  flex: 1;
+  min-width: 0;
+}
+
+.settings-panel .prompt-actions {
+  display: flex;
+  grid-column: 2;
+  flex-wrap: wrap;
+  gap: 5px;
 }
 
 .settings-panel label[for="system-prompt"] {
@@ -350,10 +409,6 @@ textarea {
     font-size: 0.7rem;
   }
 
-  .voice-button {
-    min-width: 48px;
-  }
-
   #message-input {
     padding-right: 5px;
     padding-left: 5px;
@@ -365,9 +420,17 @@ textarea {
   }
 
   .settings-panel textarea,
+  .settings-panel .host-actions,
   .settings-panel label[for="system-prompt"],
+  .settings-panel .prompt-actions,
   .settings-panel .primary-button,
   .settings-panel .status {
     grid-column: 1;
+  }
+
+  .chat-manager-actions button {
+    min-height: 32px;
+    padding: 0 8px;
+    font-size: 0.7rem;
   }
 }

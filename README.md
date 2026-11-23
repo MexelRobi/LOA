@@ -17,6 +17,18 @@ The first launch asks for an assistant name, an Ollama model, and a system promp
 
 Ask LOA to search for something online in ordinary language, for example, "Search the web for the latest Python release." LOA searches DuckDuckGo, uses the result snippets to prepare an answer, and shows the source links. Search results are untrusted content; shell commands still require explicit approval.
 
+## macOS shell actions
+
+When a request needs a local action, LOA proposes a zsh command with a reason. Review it before choosing **Run command**; canceling also returns control to the assistant so it can suggest another approach. Approved commands run in a login zsh with a 30-second timeout, and LOA uses the result to explain what happened or propose a next step. For example, ask LOA to find a named application and open it: it can first propose a Spotlight `mdfind` query, then use an approved `open -a` command based on the result.
+
+## Files and macOS apps
+
+LOA can inspect text files with `read_file` and can propose file creation or edits with a preview. File writes and AppleScript app automation always wait for your approval. Completed actions and tool results are collapsed in the transcript; click a summary to inspect the details and output.
+
+## Saved chats
+
+Chats are saved as JSON files under `~/Library/Application Support/LOA/chats`. Use **Chats**, `/chats`, or `/new` to manage conversations, switch chats, rename or delete them, and start a new one. LOA keeps a compact local index of summaries and keywords and can retrieve a short relevant excerpt from a previous chat when asked; it does not add full old transcripts to the prompt.
+
 ## Use the chat from a phone
 
 Start LOA's mobile web chat on your Mac:
@@ -46,18 +58,8 @@ The first run asks you to create the web password if one has not been set yet. T
 
 Use `--host`, `--port`, `--certfile`, and `--keyfile` when installing to customize the service. Service logs are saved under the LOA Application Support directory.
 
-## Voice input
-
-Press **Speak** in the mobile chat to dictate a message. LOA sends the recognized speech when you finish speaking and reads its answer aloud, selecting a browser voice for the reply language and speaking at a slower pace. Speech recognition and speech output depend on browser support and permission. Phone browsers require a secure HTTPS connection for microphone access. Provide a certificate trusted by your phone:
-
-```sh
-./dist/loa --web --certfile /path/to/certificate.pem --keyfile /path/to/private-key.pem
-```
-
-Install and trust the certificate on your phone before opening the HTTPS address. Voice recognition is provided by the browser and may use its configured speech service.
-
 ## Model memory use
 
-Ollama loads the selected model the first time LOA sends a chat request; starting the UI or web service does not load a model. LOA asks Ollama to unload it after two idle minutes. This keeps consecutive messages responsive while releasing model memory shortly after use.
+Ollama loads the selected model the first time LOA sends a chat request; starting the UI or web service does not load a model. LOA asks Ollama to keep it loaded for five minutes after the latest request. This keeps consecutive messages responsive while releasing its memory shortly after use.
 
 The web chat mirrors the terminal layout: centered app title, assistant/model status, a bordered transcript, and a separate message input and action row. Use `./dist/loa --help` to see all web host, port, service, password, and TLS options. The terminal chat has no Textual footer or command-palette shortcut.
