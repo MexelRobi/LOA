@@ -2,7 +2,6 @@
 
 import os
 import platform
-from pathlib import Path
 from typing import TypedDict
 
 
@@ -18,7 +17,23 @@ class AssistantConfig(TypedDict):
 DEFAULT_NAME = "LOA"
 DEFAULT_MODEL = "qwen2.5-coder:7b"
 DEFAULT_OLLAMA_HOST = "http://127.0.0.1:11434"
-DEFAULT_PROMPT = """You are LOA, a concise and helpful local assistant. Respond in clear English.
+DEFAULT_PROMPT = """You are LOA, a concise and helpful local assistant. Always reply in the same language as the user's message. Never switch to an unrelated language.
+
+Use the provided tools directly whenever an action or lookup is requested: list_directory, read_file, edit_or_write_file, run_applescript, propose_shell_command, web_search, fetch_url, and recall_past_chat. Never simulate a file edit or script in plain text when the user asks you to perform it.
+
+NEVER call recall_past_chat, read_file, web_search, or ANY tool when the user only greets you or makes small talk (e.g. 'Hallo', 'Wie geht es dir?'). Only call recall_past_chat when the user explicitly asks about an earlier chat or previous conversation.
+
+Only use web_search when the user asks for external facts, news, weather, or documentation.
+
+Chain the read-only tools autonomously as needed without asking permission, and continue until the user's request is answered.
+
+Whenever the user asks you to create, edit, append to, or save a file, call edit_or_write_file so the approval dialog can be used. Whenever the user asks you to run AppleScript or trigger macOS shortcuts or System Events, call run_applescript so the approval dialog can be used. Wait for approval before any change or action, and never claim that it succeeded until its approved result is available.
+
+NEVER invent, guess, or fabricate file contents. If the user asks you to read or show a file (such as `.todo.txt`), you MUST call `read_file` on that file path before answering.
+
+Keep final replies concise and directly answer the user's request."""
+
+OBSOLETE_DEFAULT_PROMPT = """You are LOA, a concise and helpful local assistant. Respond in clear English.
 
 Use the native tool-calling schema for actions and never print tool-call JSON or XML as plain text.
 
@@ -103,15 +118,9 @@ def build_system_prompt(
     prompt = (
         f"{base_prompt.rstrip()}\n\n"
         "Current runtime environment:\n"
-        f"- Operating system: {platform.system()} {platform.release()}\n"
+        f"- Operating system: {platform.system()}\n"
         f"- Machine architecture: {platform.machine()}\n"
-        "- Command shell: /bin/zsh\n"
-        f"- Home directory: {Path.home()}\n"
         f"- Working directory: {os.getcwd()}\n"
-        "For macOS actions, prefer native tools such as `open -a` for applications, "
-        "`osascript` for AppleScript automation, `pbcopy` for clipboard access, "
-        "`mdfind` for Spotlight searches, and `brew` for Homebrew packages. "
-        "Use paths and commands appropriate to this machine."
     )
     return f"{prompt}\n\n{build_chat_catalog(active_chat_id)}"
 

@@ -15,7 +15,7 @@ import httpx
 import ollama
 
 from loa_config import AssistantConfig, DEFAULT_OLLAMA_HOST, build_system_prompt
-from loa_storage import recall_past_chat
+from loa_storage import find_saved_chat_id, recall_past_chat
 
 MODEL_KEEP_ALIVE = "5m"
 MAX_TOOL_ITERATIONS = 8
@@ -42,6 +42,10 @@ SHELL_COMMAND_BLOCK = re.compile(
     r"```(?:bash|zsh|sh)[ \t]*\r?\n(.*?)```",
     flags=re.DOTALL | re.IGNORECASE,
 )
+APPLESCRIPT_BLOCK = re.compile(
+    r"```applescript[ \t]*\r?\n(.*?)```",
+    flags=re.DOTALL | re.IGNORECASE,
+)
 PLACEHOLDER_PATH_PATTERN = re.compile(
     r"\$\{[^}]+\}|\{\{[^}]+\}\}|\{[A-Za-z_][A-Za-z0-9_]*\}|<[^>]+>"
     r"|(?<![A-Za-z0-9])(?:FOUND|YOUR|PLACEHOLDER|INSERT|REPLACE_WITH|PATH_TO)_[A-Z0-9_]+(?![A-Za-z0-9])"
@@ -55,6 +59,16 @@ UNEXECUTED_TOOL_INTENTION_PATTERN = re.compile(
     r"i['’]ll\s+(?:read|check|search|look|inspect)|"
     r"i\s+am\s+(?:reading|checking|searching|looking)|"
     r"i['’]m\s+(?:reading|checking|searching|looking))\b",
+    flags=re.IGNORECASE,
+)
+READ_FILE_ACTION_PATTERN = re.compile(
+    r"\b(?:read|show|display|view|open|content|contents|inhalt|lesen|lese|auslesen)\b",
+    flags=re.IGNORECASE,
+)
+READ_FILE_TARGET_PATTERN = re.compile(
+    r"\b(?:file|filename|document|todo|readme)\b"
+    r"|(?<![\w])\.[A-Za-z0-9][A-Za-z0-9._-]*"
+    r"|\b[A-Za-z0-9_-]+\.[A-Za-z0-9]{1,10}\b",
     flags=re.IGNORECASE,
 )
 INVALID_PLACEHOLDER_PATH_ERROR = (
@@ -153,7 +167,7 @@ TOOLS = [
             "name": "read_file",
             "description": (
                 "Read a text file locally, returning at most 200 numbered lines. "
-                "If the path is a directory, return its first 50 entries."
+                "If the path is a directory, return its first 200 entries."
             ),
             "parameters": {
                 "type": "object",
@@ -170,14 +184,23 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "list_directory",
-            "description": "List up to 50 files and folders in a local directory.",
+            "description": (
+                "List up to 200 files and folders, including hidden files, in a "
+                "local directory. An optional substring filter matches entry names."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
                         "description": "Directory to list; defaults to the home directory.",
-                    }
+                    },
+                    "filter": {
+                        "type": "string",
+                        "description": (
+                            "Optional case-insensitive substring to match in entry names."
+                        ),
+                    },
                 },
             },
         },
@@ -243,7 +266,12 @@ def _tool_calls_from_json(value: object) -> list[ChatMessage]:
     objects = value if isinstance(value, list) else [value]
     calls: list[ChatMessage] = []
     for item in objects:
-        if not isinstance(item, dict) or item.get("name") not in SUPPORTED_TOOL_NAMES:
+        name = item.get("name") if isinstance(item, dict) else None
+        if (
+            not isinstance(name, str)
+            or not name.strip()
+            or name not in SUPPORTED_TOOL_NAMES
+        ):
             continue
         arguments = item.get("arguments")
         if isinstance(arguments, str):
@@ -256,6 +284,31 @@ def _tool_calls_from_json(value: object) -> list[ChatMessage]:
                 {"function": {"name": item["name"], "arguments": arguments}}
             )
     return calls
+
+
+def _is_empty_or_brace_only_response(content: str) -> bool:
+    payload = content.strip()
+    fenced_json = FENCED_TOOL_JSON_BLOCK.fullmatch(payload)
+    if fenced_json is not None:
+        payload = fenced_json.group(1).strip()
+    return not payload or all(
+        character.isspace() or character in "{}" for character in payload
+    )
+
+
+def _user_requested_file_read(messages: list[ChatMessage]) -> bool:
+    user_message = next(
+        (
+            str(message.get("content") or "")
+            for message in reversed(messages)
+            if message.get("role") == "user"
+        ),
+        "",
+    )
+    return (
+        READ_FILE_ACTION_PATTERN.search(user_message) is not None
+        and READ_FILE_TARGET_PATTERN.search(user_message) is not None
+    )
 
 
 def _extract_embedded_tool_calls(content: str) -> tuple[list[ChatMessage], str]:
@@ -531,6 +584,7 @@ def _request_assistant_message(
     client: ollama.Client,
     active_chat_id: str | None = None,
     tools_enabled: bool = True,
+    plain_chat: bool = False,
 ) -> tuple[object, bool]:
     """Request one response, retrying without tools for incompatible models."""
     model_messages = [
@@ -553,6 +607,14 @@ def _request_assistant_message(
         model_messages.insert(0, system_message)
     else:
         model_messages[system_index] = system_message
+    if plain_chat:
+        response = client.chat(
+            model=config["model"],
+            messages=model_messages,
+            tools=None,
+            keep_alive=MODEL_KEEP_ALIVE,
+        )
+        return response["message"], False
     if not tools_enabled:
         response = client.chat(
             model=config["model"],
@@ -642,6 +704,11 @@ def read_text_file(path: str, start_line: int = 1, end_line: int = 200) -> str:
         return INVALID_PLACEHOLDER_PATH_ERROR
     if start_line < 1 or end_line < start_line:
         raise ValueError("File line ranges must start at 1 or later and end after they start.")
+    candidate_chat_id = Path(path).name
+    if re.fullmatch(r"[a-fA-F0-9]{32}", candidate_chat_id):
+        matched_chat_id = find_saved_chat_id(candidate_chat_id)
+        if matched_chat_id is not None:
+            return recall_past_chat(chat_id=matched_chat_id, query="")
     first_line = Path(path).expanduser()
     if not first_line.exists():
         raise FileNotFoundError(f"No such file or directory: {first_line}")
@@ -663,20 +730,20 @@ def read_text_file(path: str, start_line: int = 1, end_line: int = 200) -> str:
     return "\n".join(selected_lines) or "The requested line range is empty."
 
 
-def list_directory(path: str = "~") -> str:
-    """List at most 50 entries, matching directory components case-insensitively."""
+def list_directory(path: str = "~", filter: str = "") -> str:
+    """List up to 200 directory entries, optionally filtering by name substring."""
     if _is_placeholder_path(path):
         return INVALID_PLACEHOLDER_PATH_ERROR
     requested = Path(path).expanduser()
     directory, missing_parent = _resolve_directory(requested)
     if directory is None:
         assert missing_parent is not None
-        listing = _format_directory_listing(missing_parent)
+        listing = _format_directory_listing(missing_parent, filter)
         return (
             f"Directory not found: {requested}\n"
             f"Listing parent directory {missing_parent} instead:\n{listing}"
         )
-    return _format_directory_listing(directory)
+    return _format_directory_listing(directory, filter)
 
 
 def _is_placeholder_path(path: str) -> bool:
@@ -713,20 +780,29 @@ def _resolve_directory(requested: Path) -> tuple[Path | None, Path | None]:
     return current, None
 
 
-def _format_directory_listing(directory: Path) -> str:
+def _format_directory_listing(directory: Path, filter: str = "") -> str:
     entries = sorted(
         directory.iterdir(),
-        key=lambda entry: (not entry.is_dir(), entry.name.casefold()),
+        key=lambda entry: (entry.is_dir(), entry.name.casefold()),
     )
+    if filter:
+        entries = [
+            entry for entry in entries if filter.casefold() in entry.name.casefold()
+        ]
     displayed = [
         f"- {entry.name}{'/' if entry.is_dir() else ''}"
-        for entry in entries[:50]
+        for entry in entries[:200]
     ]
     if not displayed:
+        if filter:
+            return f"No entries matching {filter!r} in {directory}"
         return f"Directory is empty: {directory}"
-    if len(entries) > 50:
-        displayed.append(f"... and {len(entries) - 50} more entries")
-    return f"Directory: {directory}\n" + "\n".join(displayed)
+    if len(entries) > 200:
+        displayed.append(f"... and {len(entries) - 200} more entries")
+    heading = f"Directory: {directory}"
+    if filter:
+        heading += f" (matching {filter!r})"
+    return heading + "\n" + "\n".join(displayed)
 
 
 def _file_write_preview(path: Path, content: str, mode: str) -> str:
@@ -892,8 +968,12 @@ def get_assistant_reply(
     sources: list[dict[str, str]] = []
     tasks: list[dict[str, str]] = []
     tools_enabled = True
+    empty_response_retry_used = False
     intention_nudge_sent = False
     intention_nudge_pending = False
+    read_file_called = False
+    read_file_nudge_sent = False
+    read_file_nudge_pending = False
     client = ollama.Client(
         host=config.get("ollama_host") or DEFAULT_OLLAMA_HOST
     )
@@ -912,6 +992,18 @@ def get_assistant_reply(
                 },
             ]
             intention_nudge_pending = False
+        elif read_file_nudge_pending:
+            request_history = [
+                *history,
+                {
+                    "role": "user",
+                    "content": (
+                        "You have not called read_file yet. Call read_file on the "
+                        "target file now instead of guessing its contents."
+                    ),
+                },
+            ]
+            read_file_nudge_pending = False
         message, tools_enabled = _request_assistant_message(
             config,
             request_history,
@@ -924,9 +1016,55 @@ def get_assistant_reply(
         tool_calls = _field(message, "tool_calls") or []
         if not tool_calls:
             tool_calls = embedded_tool_calls
+        if (
+            not tool_calls
+            and not empty_response_retry_used
+            and _is_empty_or_brace_only_response(content)
+        ):
+            empty_response_retry_used = True
+            message, tools_enabled = _request_assistant_message(
+                config,
+                request_history,
+                client,
+                active_chat_id=active_chat_id,
+                tools_enabled=False,
+                plain_chat=True,
+            )
+            raw_content = str(_field(message, "content") or "")
+            embedded_tool_calls, content = _extract_embedded_tool_calls(raw_content)
+            tool_calls = _field(message, "tool_calls") or []
+            if not tool_calls:
+                tool_calls = embedded_tool_calls
+        if not tool_calls:
+            applescript_match = APPLESCRIPT_BLOCK.search(content)
+            if applescript_match is not None:
+                script = applescript_match.group(1).strip()
+                content = APPLESCRIPT_BLOCK.sub("", content, count=1).strip()
+                tool_calls = [
+                    {
+                        "function": {
+                            "name": "run_applescript",
+                            "arguments": {
+                                "script": script,
+                                "reason": (
+                                    "The assistant suggested this AppleScript; "
+                                    "review it before approving."
+                                ),
+                            },
+                        }
+                    }
+                ]
         if not tool_calls:
             command = extract_shell_command(content)
             if command is None:
+                if (
+                    not read_file_called
+                    and not read_file_nudge_sent
+                    and _user_requested_file_read(messages)
+                ):
+                    read_file_nudge_sent = True
+                    read_file_nudge_pending = True
+                    continue
                 if (
                     step == 0
                     and not intention_nudge_sent
@@ -935,6 +1073,8 @@ def get_assistant_reply(
                     intention_nudge_sent = True
                     intention_nudge_pending = True
                     continue
+                if _is_empty_or_brace_only_response(content):
+                    content = "I couldn't generate a response. Please try again."
                 history.append({"role": "assistant", "content": content})
                 return {
                     "text": content,
@@ -961,6 +1101,26 @@ def get_assistant_reply(
                 }
             ]
 
+        if (
+            tool_calls
+            and not read_file_called
+            and not read_file_nudge_sent
+            and step < MAX_TOOL_ITERATIONS
+            and _user_requested_file_read(messages)
+            and not any(
+                _field(_field(call, "function"), "name") == "read_file"
+                for call in tool_calls
+            )
+            and any(
+                _field(_field(call, "function"), "name")
+                in {"propose_shell_command", "run_applescript", "edit_or_write_file"}
+                for call in tool_calls
+            )
+        ):
+            read_file_nudge_sent = True
+            read_file_nudge_pending = True
+            continue
+
         if step >= MAX_TOOL_ITERATIONS:
             message = (
                 "I reached the eight-step tool-call limit before I could finish. "
@@ -980,6 +1140,8 @@ def get_assistant_reply(
         normalized_calls: list[ChatMessage] = []
         for call in tool_calls:
             name, arguments = _tool_function(call)
+            if name == "read_file":
+                read_file_called = True
             normalized_call: ChatMessage = {
                 "function": {"name": name, "arguments": arguments}
             }
@@ -1084,12 +1246,17 @@ def get_assistant_reply(
                 )
             elif name == "list_directory":
                 path = arguments.get("path", "~")
+                directory_filter = arguments.get("filter", "")
                 try:
-                    if not isinstance(path, str) or not path.strip():
+                    if (
+                        not isinstance(path, str)
+                        or not path.strip()
+                        or not isinstance(directory_filter, str)
+                    ):
                         raise ValueError(
-                            "The assistant returned an invalid directory path."
+                            "The assistant returned invalid directory-list arguments."
                         )
-                    directory_contents = list_directory(path)
+                    directory_contents = list_directory(path, directory_filter)
                 except (OSError, RuntimeError, ValueError) as error:
                     directory_contents = f"Error: {error}"
                 _append_readonly_task(

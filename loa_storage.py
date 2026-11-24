@@ -388,6 +388,21 @@ def _read_chat_index() -> list[dict[str, Any]]:
     return [entry for entry in data if isinstance(entry, dict)]
 
 
+def find_saved_chat_id(chat_id: str) -> str | None:
+    """Return the canonical indexed id when the value is a 32-character hex id."""
+    if re.fullmatch(r"[a-fA-F0-9]{32}", chat_id) is None:
+        return None
+    return next(
+        (
+            str(entry["id"])
+            for entry in _read_chat_index()
+            if isinstance(entry.get("id"), str)
+            and entry["id"].casefold() == chat_id.casefold()
+        ),
+        None,
+    )
+
+
 def _update_chat_index(session: ChatSession) -> None:
     entry = {
         "id": session["id"],
@@ -462,12 +477,8 @@ def load_config() -> AssistantConfig | None:
     }
     needs_save = host_needs_save
     if (
-        "recall_past_chat" not in config["prompt"]
-        or "NEVER say you cannot see previous chats" not in config["prompt"]
-        or "ALWAYS call propose_shell_command" not in config["prompt"]
-        or "built-in Run/Cancel approval dialog" not in config["prompt"]
-        or "fetch_url" not in config["prompt"]
-        or "NEVER write filler text" not in config["prompt"]
+        "NEVER call recall_past_chat" not in config["prompt"]
+        or "NEVER invent, guess, or fabricate file contents." not in config["prompt"]
     ):
         config["prompt"] = DEFAULT_PROMPT
         needs_save = True
