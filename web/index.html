@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="color-scheme" content="dark">
   <title>LOA</title>
   <link rel="stylesheet" href="/style.css">
@@ -14,9 +14,29 @@
       <h1 id="app-title">LoaApp</h1>
     </header>
 
+    <section id="home-panel" class="home-panel" hidden>
+      <div class="home-card">
+        <p class="eyebrow">WELCOME</p>
+        <h2>Welcome to LOA</h2>
+        <p class="home-copy">Start a new conversation or continue where you left off.</p>
+        <div class="home-actions">
+          <button id="home-new-chat" class="primary-button" type="button">New Chat</button>
+          <button id="home-continue-chat" class="quiet-button" type="button" disabled>
+            Continue Last Chat
+          </button>
+          <button id="home-settings" class="quiet-button" type="button">Settings</button>
+          <button id="home-logout" class="quiet-button" type="button">Exit</button>
+        </div>
+        <h3>Recent chats</h3>
+        <div id="home-recent-chats" class="home-recent-chats"></div>
+        <p id="home-status" class="status" aria-live="polite"></p>
+      </div>
+    </section>
+
     <section id="login-panel" class="login-panel" hidden>
       <h2>Web login</h2>
       <p class="login-copy">Enter the password saved for LOA on your Mac.</p>
+      <p class="login-copy">Optional link: append <code>#pass=&lt;URL-encoded-password&gt;</code>. The fragment is removed before login; HTTP auto-login is allowed only from localhost or a Tailscale address.</p>
       <form id="login-form">
         <label class="visually-hidden" for="web-password">Web password</label>
         <input id="web-password" type="password" autocomplete="current-password"
@@ -35,22 +55,120 @@
         <button id="settings-close" class="quiet-button" type="button">Close</button>
       </div>
       <form id="settings-form">
-        <label for="assistant-name">Assistant name</label>
-        <input id="assistant-name" name="name" autocomplete="off" required>
-        <label for="model-name">Ollama model</label>
-        <input id="model-name" name="model" autocomplete="off" required>
-        <label for="ollama-host">Ollama Host URL</label>
-        <div class="host-actions">
-          <input id="ollama-host" name="ollama_host" type="url"
-            placeholder="http://127.0.0.1:11434" autocomplete="url" required>
-          <button id="reset-host" class="quiet-button" type="button">Reset Host</button>
+        <nav class="settings-tabs" aria-label="Settings sections">
+          <button type="button" class="settings-tab is-active" data-tab="general">General</button>
+          <button type="button" class="settings-tab" data-tab="about-me">About Me</button>
+          <button type="button" class="settings-tab" data-tab="brain">Brain / Memory</button>
+          <button type="button" class="settings-tab" data-tab="cronjobs">Cronjobs</button>
+          <button type="button" class="settings-tab" data-tab="skills">Skills</button>
+          <button type="button" class="settings-tab" data-tab="mcp">MCP Servers</button>
+        </nav>
+        <div class="settings-tab-panel" data-settings-panel="general">
+          <label for="assistant-name">Assistant name</label>
+          <input id="assistant-name" name="name" autocomplete="off" required>
+          <label for="model-name">Ollama model</label>
+          <input id="model-name" name="model" autocomplete="off" required>
+          <label for="ollama-host">Ollama Host URL</label>
+          <div class="host-actions">
+            <input id="ollama-host" name="ollama_host" type="url"
+              placeholder="http://127.0.0.1:11434" autocomplete="url" required>
+            <button id="reset-host" class="quiet-button" type="button">Reset Host</button>
+          </div>
+          <label for="system-prompt">System prompt</label>
+          <textarea id="system-prompt" name="prompt" rows="7" required></textarea>
+          <div class="prompt-actions">
+            <button id="reset-prompt" class="quiet-button" type="button">Reset Prompt</button>
+            <button class="primary-button" type="submit">Save settings</button>
+          </div>
         </div>
-        <label for="system-prompt">System prompt</label>
-        <textarea id="system-prompt" name="prompt" rows="7" required></textarea>
-        <div class="prompt-actions">
-          <button id="reset-prompt" class="quiet-button" type="button">Reset Prompt</button>
-          <button class="primary-button" type="submit">Save settings</button>
-        </div>
+        <section class="settings-tab-panel" data-settings-panel="about-me" hidden>
+          <h3>About Me</h3>
+          <p>These details are stored locally and included in LOA's context.</p>
+          <label for="about-name">Name</label>
+          <input id="about-name" autocomplete="off">
+          <label for="about-preferences">Preferences</label>
+          <textarea id="about-preferences" rows="3"></textarea>
+          <label for="about-hardware">Hardware and environment</label>
+          <textarea id="about-hardware" rows="3"></textarea>
+          <label for="about-routines">Routines</label>
+          <textarea id="about-routines" rows="3"></textarea>
+          <label for="about-goals">Goals</label>
+          <textarea id="about-goals" rows="3"></textarea>
+          <label for="about-notes">Custom notes</label>
+          <textarea id="about-notes" rows="4"></textarea>
+          <div class="prompt-actions">
+            <button id="save-profile" class="primary-button" type="button">Save About Me</button>
+            <p id="profile-status" class="status" aria-live="polite"></p>
+          </div>
+        </section>
+        <section class="settings-tab-panel" data-settings-panel="brain" hidden>
+          <h3>Brain / Memory</h3>
+          <p>Local token search only. Entries stay on this device.</p>
+          <label for="brain-search">Search memories</label>
+          <input id="brain-search" autocomplete="off" placeholder="Search facts and tokens">
+          <div id="brain-entries" class="memory-list"></div>
+          <label for="brain-content">Add a memory</label>
+          <textarea id="brain-content" rows="3" placeholder="A durable fact or preference"></textarea>
+          <label for="brain-category">Category</label>
+          <input id="brain-category" value="fact" autocomplete="off">
+          <button id="brain-add" class="primary-button" type="button">Add memory</button>
+          <p id="brain-status" class="status" aria-live="polite"></p>
+        </section>
+        <section class="settings-tab-panel" data-settings-panel="cronjobs" hidden>
+          <h3>Cronjobs</h3>
+          <p>Approved jobs run automatically in the background while LOA's web service is running. Use five-field cron or intervals such as <code>@every 15m</code>.</p>
+          <div id="cronjobs-list" class="memory-list"></div>
+          <label for="cron-name">Job name</label>
+          <input id="cron-name" autocomplete="off">
+          <label for="cron-schedule">Schedule</label>
+          <input id="cron-schedule" autocomplete="off" placeholder="0 9 * * 1-5 or @every 15m">
+          <label for="cron-payload">Prompt / action</label>
+          <textarea id="cron-payload" rows="4"></textarea>
+          <label class="cron-one-time-option">
+            <input id="cron-one-time" type="checkbox">
+            One-time (disable after first execution)
+          </label>
+          <button id="cron-save" class="primary-button" type="button">Create scheduled job</button>
+          <button id="cron-cancel-edit" class="quiet-button" type="button" hidden>Cancel edit</button>
+          <p id="cron-status" class="status" aria-live="polite"></p>
+          <div id="cron-history" class="cron-history"></div>
+        </section>
+        <section class="settings-tab-panel extension-settings" data-settings-panel="mcp" hidden>
+          <h3>MCP servers</h3>
+          <p>Enable servers below. Edit command, args, and env in the JSON editor; tokens are saved in your local LOA config.</p>
+          <div id="mcp-controls" class="extension-list"></div>
+          <label for="mcp-servers">Server configurations (JSON)</label>
+          <textarea id="mcp-servers" rows="10" spellcheck="false"></textarea>
+          <button id="refresh-mcp-controls" class="quiet-button" type="button">Refresh server toggles</button>
+        </section>
+        <section class="settings-tab-panel extension-settings" data-settings-panel="skills" hidden>
+          <h3>Skills</h3>
+          <div id="skills-list" class="extension-list"></div>
+          <div id="skill-editor" class="skill-editor" hidden>
+            <div class="section-heading">
+              <h4>Edit skill</h4>
+              <span id="skill-editor-name" class="skill-editor-name"></span>
+            </div>
+            <p id="skill-editor-description" class="skill-editor-description"></p>
+            <label for="skill-editor-content">Markdown / skill file</label>
+            <textarea id="skill-editor-content" rows="14" spellcheck="false"></textarea>
+            <div class="prompt-actions">
+              <button id="save-skill-edit" class="primary-button" type="button">Save</button>
+              <button id="cancel-skill-edit" class="quiet-button" type="button">Cancel</button>
+            </div>
+          </div>
+          <div class="skill-create">
+            <label for="new-skill-name">New Markdown skill</label>
+            <input id="new-skill-name" autocomplete="off" placeholder="skill-name">
+            <label for="new-skill-content">Instructions</label>
+            <textarea id="new-skill-content" rows="5"></textarea>
+            <div class="prompt-actions">
+              <button id="create-skill" class="quiet-button" type="button">Create skill</button>
+              <button id="reload-skills" class="quiet-button" type="button">Reload skills</button>
+            </div>
+          </div>
+          <p id="skills-status" class="status" aria-live="polite"></p>
+        </section>
         <p id="settings-status" class="status" aria-live="polite"></p>
       </form>
     </section>
@@ -63,6 +181,8 @@
         </div>
         <button id="chats-close" class="quiet-button" type="button">Close</button>
       </div>
+      <label for="chat-search">Search chats</label>
+      <input id="chat-search" autocomplete="off" placeholder="Filter by title or summary">
       <div id="saved-chats" class="saved-chats"></div>
       <label for="chat-title">Rename selected chat</label>
       <input id="chat-title" autocomplete="off">
@@ -70,6 +190,7 @@
         <button id="chat-open" class="primary-button" type="button">Open / Switch</button>
         <button id="chat-new" class="quiet-button" type="button">New Chat</button>
         <button id="chat-rename" class="quiet-button" type="button">Rename</button>
+        <button id="chat-vectorize" class="quiet-button" type="button">Vectorize and delete</button>
         <button id="chat-delete" class="quiet-button" type="button">Delete</button>
       </div>
       <p id="chats-status" class="status" aria-live="polite"></p>
@@ -82,8 +203,12 @@
         <label class="visually-hidden" for="message-input">Message</label>
         <textarea id="message-input" rows="1" placeholder="Message LOA" required></textarea>
       </form>
+      <div id="skill-command-hints" class="skill-command-hints" aria-label="Skill command suggestions"></div>
       <div id="chat-controls" class="chat-controls">
         <button id="send-button" class="primary-button" type="submit" form="chat-form">Send</button>
+        <button id="break-loop-button" class="quiet-button" type="button"
+          aria-hidden="true" disabled>Break Loop</button>
+        <button id="home-toggle" class="quiet-button" type="button">Home</button>
         <button id="chats-toggle" class="quiet-button" type="button" hidden>Chats</button>
         <button id="settings-toggle" class="quiet-button" type="button" hidden>Settings</button>
         <button id="logout-button" class="quiet-button" type="button" hidden>Exit</button>

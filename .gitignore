@@ -4,3 +4,4 @@ __pycache__
 dist
 loa.spec
 .DS_Store
+.playwright-mcp/

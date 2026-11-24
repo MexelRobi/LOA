@@ -13,13 +13,29 @@ Build the standalone macOS executable:
 
 The first launch asks for an assistant name, an Ollama model, and a system prompt. Settings are saved in the user's application support directory. Later launches open the chat directly; use **Settings** or `/settings` to edit them.
 
+## MCP servers and user skills
+
+The **Settings** screen lets you enable MCP servers and edit their stdio command, arguments, and environment. GitHub, Playwright, and a configurable WhatsApp server are supplied as disabled presets; configure credentials or server paths before enabling one. Playwright MCP uses `~/.cache/loa/playwright-mcp` for its working and artifact output directory, outside synced project folders. Only MCP tools clearly named as read-only (`list`, `get`, `read`, `search`, `find`, `fetch`, `snapshot`, or `screenshot`) may run without approval; all other MCP calls require explicit approval showing the server, tool, and arguments. Custom-skill calls always wait for approval. MCP environment values are stored in the private LOA settings file.
+
+User skills live in `~/.loa/skills/`. Enabled `.md` files are appended to LOA's system prompt. A Markdown skill can set `command: /trigger` in YAML frontmatter; otherwise its filename maps to `/<skill-name>`. Start a chat message with that trigger to activate the skill instructions and pass the remaining text as the request. Available triggers appear as chat suggestions and on each skill card. Python skills map to their filename and must be enabled before use. They must export `register_tools()` returning `(tool_schemas, callables)`, where schemas use Ollama's `{"type":"function","function":{"name": ..., "description": ..., "parameters": ...}}` format and callables accept tool arguments as keyword arguments. Python skills are user code; enable only files you trust. Use `/mcp [name on|off|reload]` and `/skills [name on|off|reload]` in the terminal, or the corresponding controls in the web settings. The web settings also let you edit installed skill files and reload the skill state when saved.
+
+## About Me and Brain memory
+
+Settings are organized into General, About Me, Brain / Memory, Cronjobs, Skills, and MCP Servers tabs in both interfaces. About Me profile details are saved locally and added to LOA's context. Brain entries are stored in a private local SQLite database with weighted tokens and FTS5 search; indexing, extracting chat facts, and retrieval use no cloud embedding or LLM calls. LOA can automatically remember explicit first-person preferences and searches relevant Brain entries before answering. Users can search, add, and delete entries in Settings.
+
+The Chats manager can search, rename, and switch conversations. **Vectorize and delete** extracts facts and weighted keywords locally, saves them to Brain, then deletes that chat's raw history. It asks for confirmation first.
+
+## Scheduled jobs
+
+Create interval jobs such as `@every 15m` or five-field cron expressions in either Settings UI, or ask LOA to manage a job. Mark a job **One-time** (or use `one_time: true` / `run_once: true`) to disable and mark it completed after its first execution, including failed attempts; its execution history is retained. Jobs are persisted locally and run within the same process as LOA's web server; no system `crontab` is used. They execute while `--web` or the installed web service is running. LOA proposals to create, change, enable, delete, or run a job require the normal explicit approval step, which displays the schedule and target prompt/action and warns that enabled jobs run automatically in the background. Execution history is available in the Cronjobs tab. Any follow-on system action proposed by a scheduled prompt is logged but not executed without approval.
+
 ## Web search
 
-Ask LOA to search for something online in ordinary language, for example, "Search the web for the latest Python release." LOA searches DuckDuckGo, uses the result snippets to prepare an answer, and shows the source links. Search results are untrusted content; shell commands still require explicit approval.
+Ask LOA to search for something online in ordinary language, for example, "Search the web for the latest Python release." LOA searches DuckDuckGo, uses the result snippets to prepare an answer, and shows the source links. Web pages, search results, files, MCP results, and other tool output are sandboxed as untrusted data. Suspected prompt injection triggers a security alert and requires approval for every later tool call in that turn. Credential and messaging database paths require approval before being read; shell commands always require approval.
 
 ## macOS shell actions
 
-When a request needs a local action, LOA proposes a zsh command with a reason. Review it before choosing **Run command**; canceling also returns control to the assistant so it can suggest another approach. Approved commands run in a login zsh with a 30-second timeout, and LOA uses the result to explain what happened or propose a next step. For example, ask LOA to find a named application and open it: it can first propose a Spotlight `mdfind` query, then use an approved `open -a` command based on the result.
+When a request needs a local action, LOA proposes a zsh command with a reason. Review it before choosing **Run command**. Canceling returns an explicit cancellation result and waits for your next instruction instead of retrying the action. Approved commands run in a login zsh with a 30-second timeout, and LOA uses the result to explain what happened or propose a next step. Use **Break Loop** at any time to cancel active work and return to ready state.
 
 ## Files and macOS apps
 
@@ -27,7 +43,7 @@ LOA can inspect text files with `read_file` and can propose file creation or edi
 
 ## Saved chats
 
-Chats are saved as JSON files under `~/Library/Application Support/LOA/chats`. Use **Chats**, `/chats`, or `/new` to manage conversations, switch chats, rename or delete them, and start a new one. LOA keeps a compact local index of summaries and keywords and can retrieve a short relevant excerpt from a previous chat when asked; it does not add full old transcripts to the prompt.
+Chats are saved as JSON files under `~/Library/Application Support/LOA/chats`. LOA opens to a Home screen with **New Chat**, **Continue Last Chat**, and the five most recent conversations; opening Home does not create an empty chat. A chat is created only when you choose **New Chat** or send your first message. Use **Home** or `/home` to return at any time, and use **Chats**, `/chats`, or `/new` to manage and switch conversations. LOA keeps a compact local index of summaries and keywords and can retrieve a short relevant excerpt from a previous chat when asked; it does not add full old transcripts to the prompt.
 
 ## Use the chat from a phone
 
@@ -37,7 +53,7 @@ Start LOA's mobile web chat on your Mac:
 ./dist/loa --web
 ```
 
-The first time, LOA asks in the terminal for a web password. It is saved as a salted password hash in the user's application support directory; use `./dist/loa --web --reset-web-password` to replace it. The terminal prints the local address. Open it on your phone while it is on the same Wi-Fi network as the Mac, then sign in with the saved password. Assistant settings are saved separately, loaded automatically, and are not requested again on later visits.
+The first time, LOA asks in the terminal for a web password. It is saved as a salted password hash in the user's application support directory; use `./dist/loa --web --reset-web-password` to replace it. The terminal prints the local address. Open it on your phone while it is on the same Wi-Fi network as the Mac, then sign in with the saved password. For convenience, append `#pass=<URL-encoded-password>` to the URL for automatic sign-in. The browser removes the fragment before login; LOA allows automatic login over HTTPS, localhost, or a request received from a Tailscale address. Tailscale encrypts its network traffic; ordinary unencrypted LAN connections are not allowed to use the automatic password link. Configure `--certfile` and `--keyfile` for HTTPS outside Tailscale. Assistant settings are saved separately, loaded automatically, and are not requested again on later visits.
 
 The server uses an HTTP-only session cookie after password sign-in. Use it only on a trusted private network: HTTP does not encrypt the password or conversation in transit. Stop the server with `Ctrl+C`.
 
@@ -62,4 +78,4 @@ Use `--host`, `--port`, `--certfile`, and `--keyfile` when installing to customi
 
 Ollama loads the selected model the first time LOA sends a chat request; starting the UI or web service does not load a model. LOA asks Ollama to keep it loaded for five minutes after the latest request. This keeps consecutive messages responsive while releasing its memory shortly after use.
 
-The web chat mirrors the terminal layout: centered app title, assistant/model status, a bordered transcript, and a separate message input and action row. Use `./dist/loa --help` to see all web host, port, service, password, and TLS options. The terminal chat has no Textual footer or command-palette shortcut.
+The web chat has a flat transcript with user messages aligned right and LOA responses left; messages have no chat-bubble backgrounds. Use `./dist/loa --help` to see all web host, port, service, password, and TLS options. The terminal chat has no Textual footer or command-palette shortcut.

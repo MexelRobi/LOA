@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hmac
+import ipaddress
 import json
 import getpass
 import secrets
@@ -14,7 +15,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 import httpx
 import ollama
@@ -22,13 +23,38 @@ from ddgs.exceptions import DDGSException
 
 from loa_auth import MIN_PASSWORD_LENGTH, has_web_password, save_web_password, verify_web_password
 from loa_agent import (
+    AgentCancelled,
+    AgentCancellation,
+    BREAK_LOOP_MESSAGE,
+    CANCELED_ACTION_RESPONSE,
     action_task,
+    configure_runtime_tools,
     execute_approved_action,
     format_ollama_error,
     get_assistant_reply,
     public_action,
     restore_pending_action,
+    run_scheduled_prompt,
     sanitize_tool_content,
+    tool_output_security_metadata,
+    wrap_untrusted_tool_output,
+)
+from loa_brain import (
+    add_brain_entry,
+    delete_brain_entry,
+    extract_chat_memories,
+    list_brain_entries,
+    load_about_me,
+    save_about_me,
+)
+from loa_cron import (
+    create_cron_job,
+    cron_scheduler,
+    delete_cron_job,
+    get_cron_job_history,
+    list_cron_jobs,
+    toggle_cron_job,
+    update_cron_job,
 )
 from loa_config import (
     AssistantConfig,
@@ -48,9 +74,32 @@ from loa_storage import (
     save_chat_session,
     save_config,
 )
+from loa_mcp import mcp_manager
+from loa_skills import (
+    activate_skill_command,
+    create_markdown_skill,
+    list_user_skills,
+    read_user_skill,
+    reload_skill_modules,
+    resolve_skill_command,
+    save_user_skill,
+)
 
 
 MAX_REQUEST_BYTES = 1_000_000
+TAILNET_NETWORKS = (
+    ipaddress.ip_network("100.64.0.0/10"),
+    ipaddress.ip_network("fd7a:115c:a1e0::/48"),
+)
+
+
+def _http_auto_login_allowed(client_ip: str) -> bool:
+    """Allow HTTP link-login only from loopback or a Tailscale address."""
+    try:
+        address = ipaddress.ip_address(client_ip)
+    except ValueError:
+        return False
+    return address.is_loopback or any(address in network for network in TAILNET_NETWORKS)
 
 
 def _session_transcript(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -82,8 +131,24 @@ def _session_transcript(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def _save_active_chat(state: WebChatState) -> None:
+    if state.session is None:
+        return
     state.session["messages"] = [message.copy() for message in state.messages]
     save_chat_session(state.session)
+
+
+def _required_string(payload: dict[str, Any], key: str) -> str:
+    value = payload.get(key)
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{key.replace('_', ' ').capitalize()} is required.")
+    return value.strip()
+
+
+def _optional_string(payload: dict[str, Any], key: str) -> str | None:
+    value = payload.get(key)
+    if value is not None and not isinstance(value, str):
+        raise ValueError(f"{key.replace('_', ' ').capitalize()} must be text.")
+    return value.strip() if isinstance(value, str) else None
 
 
 class WebChatState:
@@ -92,21 +157,15 @@ class WebChatState:
     def __init__(self, config: AssistantConfig | None) -> None:
         self.config = config or default_config()
         self.configured = config is not None
+        self.mcp_status = configure_runtime_tools(self.config)
         self.lock = threading.RLock()
+        self.auth_lock = threading.RLock()
+        self.cancellation_lock = threading.Lock()
+        self.active_cancellation: AgentCancellation | None = None
         self.sessions: dict[str, float] = {}
         self.failed_logins: dict[str, list[float]] = {}
-        self.session = new_chat_session()
-        self.messages: list[dict[str, Any]] = [
-            {
-                "role": "system",
-                "content": build_system_prompt(
-                    self.config["prompt"],
-                    self.session["id"],
-                ),
-            }
-        ]
-        self.session["messages"] = self.messages
-        save_chat_session(self.session)
+        self.session: ChatSession | None = None
+        self.messages: list[dict[str, Any]] = []
         self.transcript: list[dict[str, Any]] = []
         self.pending_action: dict[str, Any] | None = None
         self.pending_command: str | None = None
@@ -152,6 +211,12 @@ class LoaRequestHandler(BaseHTTPRequestHandler):
         super().end_headers()
 
     def do_GET(self) -> None:
+        try:
+            self._handle_get()
+        except (OSError, RuntimeError, ValueError) as error:
+            self._send_json({"error": str(error)}, status=500)
+
+    def _handle_get(self) -> None:
         path = urlsplit(self.path).path
         asset_types = {
             "/": ("index.html", "text/html; charset=utf-8"),
@@ -164,7 +229,15 @@ class LoaRequestHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/auth/status":
-            self._send_json({"password_configured": has_web_password()})
+            self._send_json(
+                {
+                    "password_configured": has_web_password(),
+                    "allow_http_auto_login": (
+                        self.server.secure
+                        or _http_auto_login_allowed(self.client_address[0])
+                    ),
+                }
+            )
             return
         if path == "/auth/session":
             self._send_json({"authenticated": self._authorized()})
@@ -178,35 +251,57 @@ class LoaRequestHandler(BaseHTTPRequestHandler):
             if path == "/api/chats":
                 self._send_json(
                     {
-                        "active_chat_id": self.server.state.session["id"],
+                        "active_chat_id": (
+                            self.server.state.session["id"]
+                            if self.server.state.session
+                            else None
+                        ),
                         "chats": [
                             {
                                 "id": chat["id"],
                                 "title": chat["title"],
                                 "updated_at": chat["updated_at"],
                                 "summary": chat["summary"],
+                                "message_count": sum(
+                                    1
+                                    for message in chat["messages"]
+                                    if message.get("role") in {"user", "assistant"}
+                                    and str(message.get("content") or "").strip()
+                                ),
                             }
                             for chat in list_chat_sessions()
                         ],
                     }
                 )
             elif path == "/api/config":
+                state = self.server.state
                 self._send_json(
                     {
-                        "name": self.server.state.config["name"],
-                        "model": self.server.state.config["model"],
-                        "prompt": self.server.state.config["prompt"],
-                        "ollama_host": self.server.state.config["ollama_host"],
+                        "name": state.config["name"],
+                        "model": state.config["model"],
+                        "prompt": state.config["prompt"],
+                        "ollama_host": state.config["ollama_host"],
+                        "mcp_servers": state.config.get("mcp_servers", []),
+                        "skill_states": state.config.get("skill_states", {}),
+                        "skills": list_user_skills(state.config.get("skill_states", {})),
+                        "mcp_status": mcp_manager.statuses(),
                         "default_ollama_host": DEFAULT_OLLAMA_HOST,
                         "default_prompt": DEFAULT_PROMPT,
                         "configured": self.server.state.configured,
+                        "profile": load_about_me(),
+                        "brain_entries": list_brain_entries(),
+                        "cron_jobs": list_cron_jobs(),
                     }
                 )
             elif path == "/api/history":
                 self._send_json(
                     {
                         "transcript": self.server.state.transcript,
-                        "active_chat_id": self.server.state.session["id"],
+                        "active_chat_id": (
+                            self.server.state.session["id"]
+                            if self.server.state.session
+                            else None
+                        ),
                         "pending_action": (
                             public_action(self.server.state.pending_action)
                             if self.server.state.pending_action
@@ -215,6 +310,18 @@ class LoaRequestHandler(BaseHTTPRequestHandler):
                         "pending_command": self.server.state.pending_command,
                         "command_reason": self.server.state.pending_command_reason,
                     }
+                )
+            elif path == "/api/brain":
+                query = parse_qs(urlsplit(self.path).query).get("q", [""])[0].strip()
+                self._send_json({"entries": list_brain_entries(query)})
+            elif path == "/api/profile":
+                self._send_json({"profile": load_about_me()})
+            elif path == "/api/cronjobs":
+                self._send_json({"jobs": list_cron_jobs()})
+            elif path.startswith("/api/cronjobs/") and path.endswith("/history"):
+                job_id = path.removeprefix("/api/cronjobs/").removesuffix("/history").strip("/")
+                self._send_json(
+                    {"history": get_cron_job_history(job_id), "job_id": job_id}
                 )
             else:
                 self._send_json({"error": "Not found"}, status=404)
@@ -226,6 +333,12 @@ class LoaRequestHandler(BaseHTTPRequestHandler):
             if path == "/auth/login":
                 self._login(payload)
                 return
+            if path == "/api/break-loop":
+                if not self._authorized():
+                    self._send_json({"error": "Unauthorized"}, status=401)
+                    return
+                self._break_loop()
+                return
             with self.server.state.lock:
                 if not self._authorized():
                     self._send_json({"error": "Unauthorized"}, status=401)
@@ -236,6 +349,16 @@ class LoaRequestHandler(BaseHTTPRequestHandler):
                     self._handle_chats(payload)
                 elif path == "/api/settings":
                     self._save_settings(payload)
+                elif path == "/api/skills":
+                    self._handle_skills(payload)
+                elif path == "/api/mcp":
+                    self._handle_mcp(payload)
+                elif path == "/api/brain":
+                    self._handle_brain(payload)
+                elif path == "/api/profile":
+                    self._save_profile(payload)
+                elif path == "/api/cronjobs":
+                    self._handle_cronjobs(payload)
                 elif path == "/api/chat":
                     self._send_message(payload)
                 elif path == "/api/command":
@@ -256,7 +379,7 @@ class LoaRequestHandler(BaseHTTPRequestHandler):
                 cookies[key] = value
         session = cookies.get("loa_session", "")
         now = time.monotonic()
-        with self.server.state.lock:
+        with self.server.state.auth_lock:
             for saved_session, expiry in list(self.server.state.sessions.items()):
                 if expiry <= now:
                     self.server.state.sessions.pop(saved_session, None)
@@ -268,6 +391,22 @@ class LoaRequestHandler(BaseHTTPRequestHandler):
         password = payload.get("password")
         if not isinstance(password, str):
             raise ValueError("Password is required.")
+        auto_login = payload.get("auto_login", False)
+        if not isinstance(auto_login, bool):
+            raise ValueError("Auto-login flag must be a boolean.")
+        if auto_login and not (
+            self.server.secure or _http_auto_login_allowed(self.client_address[0])
+        ):
+            self._send_json(
+                {
+                    "error": (
+                        "HTTP auto-login is allowed only over HTTPS, localhost, "
+                        "or a Tailscale connection."
+                    )
+                },
+                status=403,
+            )
+            return
         client_ip = self.client_address[0]
         now = time.monotonic()
         attempts = [
@@ -289,16 +428,18 @@ class LoaRequestHandler(BaseHTTPRequestHandler):
             return
 
         session = secrets.token_urlsafe(32)
-        self.server.state.sessions[session] = now + 12 * 60 * 60
+        with self.server.state.auth_lock:
+            self.server.state.sessions[session] = now + 12 * 60 * 60
         self.server.state.failed_logins.pop(client_ip, None)
         self._send_json({"ok": True}, cookie=session)
 
     def _logout(self) -> None:
         cookie_header = self.headers.get("Cookie", "")
-        for item in cookie_header.split(";"):
-            key, separator, value = item.strip().partition("=")
-            if key == "loa_session" and separator:
-                self.server.state.sessions.pop(value, None)
+        with self.server.state.auth_lock:
+            for item in cookie_header.split(";"):
+                key, separator, value = item.strip().partition("=")
+                if key == "loa_session" and separator:
+                    self.server.state.sessions.pop(value, None)
         self._send_json({"ok": True}, clear_cookie=True)
 
     def _read_json(self) -> dict[str, Any]:
@@ -317,6 +458,7 @@ class LoaRequestHandler(BaseHTTPRequestHandler):
         return payload
 
     def _save_settings(self, payload: dict[str, Any]) -> None:
+        state = self.server.state
         config = {
             key: payload.get(key)
             for key in ("name", "model", "prompt")
@@ -338,31 +480,212 @@ class LoaRequestHandler(BaseHTTPRequestHandler):
             "model": config["model"].strip(),
             "prompt": config["prompt"].strip(),
             "ollama_host": ollama_host,
+            "mcp_servers": payload.get(
+                "mcp_servers",
+                state.config.get("mcp_servers", []),
+            ),
+            "skill_states": payload.get(
+                "skill_states",
+                state.config.get("skill_states", {}),
+            ),
         }
         save_config(assistant_config)
-        state = self.server.state
+        reload_skill_modules()
+        state.mcp_status = configure_runtime_tools(
+            assistant_config,
+            force_mcp_reload=True,
+        )
         state.config = assistant_config
         state.configured = True
-        if state.messages:
+        if state.session is not None and state.messages:
             state.messages[0] = {
                 "role": "system",
                 "content": build_system_prompt(
                     assistant_config["prompt"],
                     state.session["id"],
+                    assistant_config["skill_states"],
                 ),
             }
-        else:
-            state.messages = [
+            _save_active_chat(state)
+        self._send_json(
+            {
+                "ok": True,
+                "name": assistant_config["name"],
+                "mcp_status": state.mcp_status,
+                "skills": list_user_skills(assistant_config["skill_states"]),
+            }
+        )
+
+    def _handle_skills(self, payload: dict[str, Any]) -> None:
+        state = self.server.state
+        operation = payload.get("action")
+        if operation == "list":
+            self._send_json(
                 {
-                    "role": "system",
-                    "content": build_system_prompt(
-                        assistant_config["prompt"],
-                        state.session["id"],
-                    ),
+                    "ok": True,
+                    "skills": list_user_skills(state.config.get("skill_states", {})),
+                    "skill_states": state.config.get("skill_states", {}),
+                    "mcp_status": mcp_manager.statuses(),
                 }
-            ]
-        _save_active_chat(state)
-        self._send_json({"ok": True, "name": assistant_config["name"]})
+            )
+            return
+        if operation == "read":
+            name = payload.get("name")
+            if not isinstance(name, str):
+                raise ValueError("Skill name is required.")
+            self._send_json({"ok": True, **read_user_skill(name)})
+            return
+        if operation == "create":
+            name = payload.get("name")
+            content = payload.get("content")
+            if not isinstance(name, str) or not isinstance(content, str):
+                raise ValueError("Skill name and Markdown content are required.")
+            path = create_markdown_skill(name, content)
+            state.config["skill_states"].setdefault(path.name, False)
+            save_config(state.config)
+        elif operation == "edit":
+            name = payload.get("name")
+            content = payload.get("content")
+            if not isinstance(name, str) or not isinstance(content, str):
+                raise ValueError("Skill name and content are required.")
+            save_user_skill(name, content)
+        elif operation == "toggle":
+            name = payload.get("name")
+            enabled = payload.get("enabled")
+            if not isinstance(name, str) or not isinstance(enabled, bool):
+                raise ValueError("Skill name and enabled state are required.")
+            if not any(skill["name"] == name for skill in list_user_skills()):
+                raise ValueError(f"Skill not found: {name}")
+            state.config["skill_states"][name] = enabled
+            save_config(state.config)
+        elif operation != "reload":
+            raise ValueError("Unsupported skills operation.")
+
+        reload_skill_modules()
+        configure_runtime_tools(state.config)
+        if state.session is not None and state.messages and state.messages[0].get("role") == "system":
+            state.messages[0]["content"] = build_system_prompt(
+                state.config["prompt"],
+                state.session["id"],
+                state.config.get("skill_states", {}),
+            )
+            _save_active_chat(state)
+        self._send_json(
+            {
+                "ok": True,
+                "skills": list_user_skills(state.config.get("skill_states", {})),
+                "skill_states": state.config.get("skill_states", {}),
+                "mcp_status": mcp_manager.statuses(),
+            }
+        )
+
+    def _handle_mcp(self, payload: dict[str, Any]) -> None:
+        state = self.server.state
+        name = payload.get("name")
+        enabled = payload.get("enabled")
+        if not isinstance(name, str) or not isinstance(enabled, bool):
+            raise ValueError("MCP server name and enabled state are required.")
+        server = next(
+            (
+                item
+                for item in state.config.get("mcp_servers", [])
+                if item.get("name") == name
+            ),
+            None,
+        )
+        if server is None:
+            raise ValueError(f"MCP server not found: {name}")
+        server["enabled"] = enabled
+        save_config(state.config)
+        state.mcp_status = configure_runtime_tools(
+            state.config,
+            force_mcp_reload=True,
+        )
+        self._send_json({"ok": True, "mcp_status": state.mcp_status})
+
+    def _handle_brain(self, payload: dict[str, Any]) -> None:
+        operation = payload.get("action")
+        if operation == "add":
+            content = payload.get("content")
+            category = payload.get("category", "fact")
+            if not isinstance(content, str) or not isinstance(category, str):
+                raise ValueError("Brain entry content and category must be text.")
+            entry = add_brain_entry(content, category)
+            self._send_json({"ok": True, "entry": entry, "entries": list_brain_entries()})
+        elif operation == "delete":
+            entry_id = payload.get("id")
+            if not isinstance(entry_id, str):
+                raise ValueError("Brain entry id is required.")
+            delete_brain_entry(entry_id)
+            self._send_json({"ok": True, "entries": list_brain_entries()})
+        elif operation == "search":
+            query = payload.get("query", "")
+            if not isinstance(query, str):
+                raise ValueError("Brain search query must be text.")
+            self._send_json({"ok": True, "entries": list_brain_entries(query)})
+        else:
+            raise ValueError("Choose add, delete, or search for Brain management.")
+
+    def _save_profile(self, payload: dict[str, Any]) -> None:
+        profile = payload.get("profile")
+        if not isinstance(profile, dict):
+            raise ValueError("About Me profile must be an object.")
+        if any(not isinstance(key, str) or not isinstance(value, str) for key, value in profile.items()):
+            raise ValueError("About Me profile fields must be text.")
+        saved = save_about_me(profile)
+        state = self.server.state
+        if state.session is not None and state.messages and state.messages[0].get("role") == "system":
+            state.messages[0]["content"] = build_system_prompt(
+                state.config["prompt"],
+                state.session["id"],
+                state.config.get("skill_states", {}),
+            )
+            _save_active_chat(state)
+        self._send_json({"ok": True, "profile": saved})
+
+    def _handle_cronjobs(self, payload: dict[str, Any]) -> None:
+        operation = payload.get("action")
+        if operation == "create":
+            job = create_cron_job(
+                _required_string(payload, "name"),
+                _required_string(payload, "schedule"),
+                _required_string(payload, "payload"),
+                one_time=payload.get("one_time"),
+                run_once=payload.get("run_once"),
+            )
+        elif operation == "update":
+            job_id = _required_string(payload, "job_id")
+            job = update_cron_job(
+                job_id,
+                name=_optional_string(payload, "name"),
+                schedule=_optional_string(payload, "schedule"),
+                payload=_optional_string(payload, "payload"),
+                one_time=payload.get("one_time"),
+                run_once=payload.get("run_once"),
+            )
+        elif operation == "toggle":
+            enabled = payload.get("enabled")
+            if not isinstance(enabled, bool):
+                raise ValueError("Cronjob enabled state must be a boolean.")
+            job = toggle_cron_job(_required_string(payload, "job_id"), enabled)
+        elif operation == "delete":
+            job_id = _required_string(payload, "job_id")
+            delete_cron_job(job_id)
+            self._send_json({"ok": True, "jobs": list_cron_jobs()})
+            return
+        elif operation == "run":
+            output = cron_scheduler.run_now(_required_string(payload, "job_id"))
+            self._send_json(
+                {
+                    "ok": True,
+                    "output": output,
+                    "history": get_cron_job_history(_required_string(payload, "job_id")),
+                }
+            )
+            return
+        else:
+            raise ValueError("Choose create, update, toggle, delete, or run for cronjobs.")
+        self._send_json({"ok": True, "job": job, "jobs": list_cron_jobs()})
 
     def _handle_chats(self, payload: dict[str, Any]) -> None:
         state = self.server.state
@@ -370,10 +693,24 @@ class LoaRequestHandler(BaseHTTPRequestHandler):
         if not isinstance(operation, str) or operation not in {
             "new",
             "open",
+            "home",
             "rename",
             "delete",
+            "vectorize",
         }:
-            raise ValueError("Choose new, open, rename, or delete for chat management.")
+            raise ValueError("Choose new, open, home, rename, delete, or vectorize for chat management.")
+        if operation == "home":
+            self._deactivate_chat()
+            self._send_json(
+                {
+                    "ok": True,
+                    "active_chat_id": None,
+                    "chat": None,
+                    "transcript": [],
+                    "pending_action": None,
+                }
+            )
+            return
         if state.pending_action is not None:
             raise ValueError("Approve or cancel the pending action before managing chats.")
 
@@ -391,24 +728,52 @@ class LoaRequestHandler(BaseHTTPRequestHandler):
                 if not isinstance(title, str):
                     raise ValueError("A title is required.")
                 renamed = rename_chat_session(chat_id, title)
-                if state.session["id"] == chat_id:
+                if state.session is not None and state.session["id"] == chat_id:
                     state.session = renamed
                     _save_active_chat(state)
             elif operation == "delete":
+                if state.session is not None and state.session["id"] == chat_id:
+                    self._deactivate_chat()
                 delete_chat_session(chat_id)
-                if state.session["id"] == chat_id:
-                    self._activate_chat(new_chat_session())
+            elif operation == "vectorize":
+                session = load_chat_session(chat_id)
+                memories = extract_chat_memories(session["messages"])
+                if not memories:
+                    raise ValueError("No useful user facts or tokens were found; the chat was kept.")
+                if state.session is not None and state.session["id"] == chat_id:
+                    self._deactivate_chat()
+                delete_chat_session(chat_id)
+                self._send_json(
+                    {
+                        "ok": True,
+                        "vectorized_count": len(memories),
+                        "active_chat_id": (
+                            state.session["id"] if state.session else None
+                        ),
+                        "transcript": state.transcript,
+                        "pending_action": (
+                            public_action(state.pending_action)
+                            if state.pending_action
+                            else None
+                        ),
+                    }
+                )
+                return
 
         self._send_json(
             {
                 "ok": True,
-                "active_chat_id": state.session["id"],
-                "chat": {
-                    "id": state.session["id"],
-                    "title": state.session["title"],
-                    "updated_at": state.session["updated_at"],
-                    "summary": state.session["summary"],
-                },
+                "active_chat_id": state.session["id"] if state.session else None,
+                "chat": (
+                    {
+                        "id": state.session["id"],
+                        "title": state.session["title"],
+                        "updated_at": state.session["updated_at"],
+                        "summary": state.session["summary"],
+                    }
+                    if state.session
+                    else None
+                ),
                 "pending_action": (
                     public_action(state.pending_action)
                     if state.pending_action
@@ -418,13 +783,14 @@ class LoaRequestHandler(BaseHTTPRequestHandler):
             }
         )
 
-    def _activate_chat(self, session: ChatSession) -> None:
+    def _activate_chat(self, session: ChatSession, persist: bool = True) -> None:
         state = self.server.state
         state.session = session
         state.messages = [message.copy() for message in session["messages"]]
         system_prompt = build_system_prompt(
             state.config["prompt"],
             session["id"],
+            state.config.get("skill_states", {}),
         )
         if state.messages and state.messages[0].get("role") == "system":
             state.messages[0]["content"] = system_prompt
@@ -443,7 +809,95 @@ class LoaRequestHandler(BaseHTTPRequestHandler):
             if state.pending_action
             else None
         )
+        if persist:
+            _save_active_chat(state)
+
+    def _deactivate_chat(self) -> None:
+        state = self.server.state
+        state.session = None
+        state.messages = []
+        state.transcript = []
+        state.pending_action = None
+        state.pending_command = None
+        state.pending_command_reason = None
+
+    def _begin_operation(self) -> AgentCancellation:
+        cancellation = AgentCancellation()
+        with self.server.state.cancellation_lock:
+            self.server.state.active_cancellation = cancellation
+        return cancellation
+
+    def _finish_operation(self, cancellation: AgentCancellation) -> bool:
+        with self.server.state.cancellation_lock:
+            if self.server.state.active_cancellation is cancellation:
+                self.server.state.active_cancellation = None
+            return not cancellation.event.is_set()
+
+    def _record_canceled_action(
+        self,
+        action: dict[str, Any],
+    ) -> dict[str, str]:
+        state = self.server.state
+        task = action_task(action, CANCELED_ACTION_RESPONSE)
+        tool_name = str(action.get("tool_name") or action.get("type") or "action")
+        entry = {
+            "role": "tool",
+            "tool_name": tool_name,
+            "content": CANCELED_ACTION_RESPONSE,
+            "ui": {
+                "type": "action",
+                "summary": "Request canceled by user",
+                "details": task["details"],
+            },
+        }
+        state.messages.append(entry)
+        state.transcript.append(
+            {"role": "tool", "content": CANCELED_ACTION_RESPONSE, "ui": entry["ui"]}
+        )
+        return task
+
+    def _record_loop_break(
+        self,
+        action: dict[str, Any] | None = None,
+    ) -> dict[str, str] | None:
+        state = self.server.state
+        task = self._record_canceled_action(action) if action is not None else None
+        state.pending_action = None
+        state.pending_command = None
+        state.pending_command_reason = None
+        state.messages.append({"role": "user", "content": BREAK_LOOP_MESSAGE})
+        state.transcript = _session_transcript(state.messages)
         _save_active_chat(state)
+        return task
+
+    def _break_loop(self) -> None:
+        state = self.server.state
+        with state.cancellation_lock:
+            cancellation = state.active_cancellation
+            if cancellation is not None:
+                cancellation.cancel()
+        if cancellation is not None:
+            self._send_json({"ok": True, "active": True})
+            return
+
+        with state.lock:
+            with state.cancellation_lock:
+                cancellation = state.active_cancellation
+                if cancellation is not None:
+                    cancellation.cancel()
+            if cancellation is not None:
+                self._send_json({"ok": True, "active": True})
+                return
+            action = state.pending_action
+            canceled_action_task = self._record_loop_break(action)
+            self._send_json(
+                {
+                    "ok": True,
+                    "active": False,
+                    "action_task": canceled_action_task,
+                    "transcript": state.transcript,
+                }
+            )
 
     def _send_message(self, payload: dict[str, Any]) -> None:
         text = payload.get("message")
@@ -456,20 +910,41 @@ class LoaRequestHandler(BaseHTTPRequestHandler):
             raise ValueError("Approve or cancel the pending action first.")
 
         text = text.strip()
+        skill = resolve_skill_command(text, state.config.get("skill_states", {}))
+        if state.session is None:
+            self._activate_chat(new_chat_session(), persist=False)
+        if skill is not None:
+            activate_skill_command(state.messages, skill)
         if state.messages and state.messages[0].get("role") == "system":
             state.messages[0]["content"] = build_system_prompt(
                 state.config["prompt"],
                 state.session["id"],
+                state.config.get("skill_states", {}),
             )
         state.messages.append({"role": "user", "content": text})
         state.transcript.append({"role": "user", "content": text})
         _save_active_chat(state)
+        cancellation = self._begin_operation()
         try:
             answer = get_assistant_reply(
                 state.config,
                 state.messages,
                 active_chat_id=state.session["id"],
+                cancellation=cancellation,
             )
+            if not self._finish_operation(cancellation):
+                raise AgentCancelled()
+        except AgentCancelled:
+            self._record_loop_break()
+            self._send_json(
+                {
+                    "reply": "",
+                    "canceled": True,
+                    "transcript": state.transcript,
+                    "chat_id": state.session["id"],
+                }
+            )
+            return
         except (
             ollama.ResponseError,
             httpx.HTTPError,
@@ -490,6 +965,8 @@ class LoaRequestHandler(BaseHTTPRequestHandler):
                 status=502,
             )
             return
+        finally:
+            self._finish_operation(cancellation)
 
         state.messages = answer["history"]
         if answer["sources"]:
@@ -533,50 +1010,96 @@ class LoaRequestHandler(BaseHTTPRequestHandler):
         state.pending_command = None
         state.pending_command_reason = None
         if approved is not True:
-            output = "Action was canceled; no changes were made."
-        else:
+            output = CANCELED_ACTION_RESPONSE
+            action_task_entry = self._record_canceled_action(action)
+            _save_active_chat(state)
+            self._send_json(
+                {
+                    "output": output,
+                    "canceled": True,
+                    "action_task": action_task_entry,
+                    "tasks": [],
+                    "transcript": state.transcript,
+                }
+            )
+            return
+
+        cancellation = self._begin_operation()
+        output: str | None = None
+        action_task_entry: dict[str, str] | None = None
+        try:
             try:
-                output = execute_approved_action(action)
+                output = execute_approved_action(action, cancellation)
+            except AgentCancelled:
+                canceled_action_task = self._record_loop_break(action)
+                self._send_json(
+                    {
+                        "output": CANCELED_ACTION_RESPONSE,
+                        "canceled": True,
+                        "action_task": canceled_action_task,
+                        "transcript": state.transcript,
+                        "chat_id": state.session["id"],
+                    }
+                )
+                return
             except (
                 OSError,
                 RuntimeError,
                 subprocess.SubprocessError,
                 ValueError,
             ) as error:
-                output = f"Action execution failed: {error}"
-        task = action_task(action, output)
-        details = task["details"]
-        state.messages.append(
-            {
-                "role": "tool",
-                "tool_name": str(action["tool_name"]),
-                "content": output,
-                "ui": {
-                    "type": "action",
-                    "summary": task["label"],
-                    "details": details,
-                },
-            }
-        )
-        state.transcript.append(
-            {
-                "role": "tool",
-                "content": output,
-                "ui": {
-                    "type": "action",
-                    "summary": task["label"],
-                    "details": details,
-                },
-            }
-        )
-        action_task_entry = task
-        _save_active_chat(state)
-        try:
+                output, _ = wrap_untrusted_tool_output(
+                    str(action.get("tool_name") or action.get("type") or "action"),
+                    f"Action execution failed: {error}",
+                )
+            task = action_task(action, output)
+            details = task["details"]
+            state.messages.append(
+                {
+                    "role": "tool",
+                    "tool_name": str(action["tool_name"]),
+                    "content": output,
+                    **tool_output_security_metadata(output),
+                    "ui": {
+                        "type": "action",
+                        "summary": task["label"],
+                        "details": details,
+                    },
+                }
+            )
+            state.transcript.append(
+                {
+                    "role": "tool",
+                    "content": output,
+                    "ui": {
+                        "type": "action",
+                        "summary": task["label"],
+                        "details": details,
+                    },
+                }
+            )
+            action_task_entry = task
+            _save_active_chat(state)
             answer = get_assistant_reply(
                 state.config,
                 state.messages,
                 active_chat_id=state.session["id"],
+                cancellation=cancellation,
             )
+            if not self._finish_operation(cancellation):
+                raise AgentCancelled()
+        except AgentCancelled:
+            self._record_loop_break()
+            self._send_json(
+                {
+                    "output": output or CANCELED_ACTION_RESPONSE,
+                    "canceled": True,
+                    "action_task": action_task_entry,
+                    "transcript": state.transcript,
+                    "chat_id": state.session["id"],
+                }
+            )
+            return
         except (
             ollama.ResponseError,
             httpx.HTTPError,
@@ -599,6 +1122,8 @@ class LoaRequestHandler(BaseHTTPRequestHandler):
                 }
             )
             return
+        finally:
+            self._finish_operation(cancellation)
 
         state.messages = answer["history"]
         if answer["sources"]:
@@ -742,7 +1267,9 @@ def run_web_server(
     for address in addresses:
         url = f"{scheme}://{address}:{actual_port}/"
         print(f"  {url}")
+    cron_scheduler.start(lambda job: run_scheduled_prompt(state.config, job))
     try:
         server.serve_forever()
     finally:
+        cron_scheduler.stop()
         server.server_close()

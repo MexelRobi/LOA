@@ -5,6 +5,7 @@ import os
 import re
 import sys
 import uuid
+from copy import deepcopy
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
@@ -12,8 +13,10 @@ from typing import Any, TypedDict
 
 from loa_config import (
     AssistantConfig,
+    DEFAULT_MCP_SERVERS,
     DEFAULT_PROMPT,
     default_ollama_host,
+    ensure_security_directive,
 )
 
 
@@ -49,6 +52,22 @@ def chats_directory_path() -> Path:
 def chats_index_path() -> Path:
     """Return the lightweight cross-chat metadata index path."""
     return config_file_path().parent / "chats_index.json"
+
+
+def skills_directory_path() -> Path:
+    """Return the user's installed LOA skills directory."""
+    return Path.home() / ".loa" / "skills"
+
+
+def ensure_skills_directory() -> Path:
+    """Create the user skills directory with private permissions."""
+    directory = skills_directory_path()
+    try:
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        directory.chmod(0o700)
+    except OSError as error:
+        raise RuntimeError(f"Could not create the skills directory at {directory}: {error}") from error
+    return directory
 
 
 def new_chat_session() -> ChatSession:
@@ -446,6 +465,7 @@ def _atomic_write_json(path: Path, data: object) -> None:
 
 def load_config() -> AssistantConfig | None:
     """Load saved settings, returning None when the user has not set up LOA."""
+    ensure_skills_directory()
     path = config_file_path()
     if not path.exists():
         return None
@@ -455,8 +475,10 @@ def load_config() -> AssistantConfig | None:
     except (OSError, json.JSONDecodeError) as error:
         raise RuntimeError(f"Could not read LOA settings at {path}: {error}") from error
 
-    if not isinstance(data, dict) or any(
-        not isinstance(data.get(key), str) for key in ("name", "model", "prompt")
+    if (
+        not isinstance(data, dict)
+        or any(not isinstance(data.get(key), str) for key in ("name", "model"))
+        or ("prompt" in data and not isinstance(data["prompt"], str))
     ):
         raise RuntimeError(
             f"LOA settings at {path} are invalid. Use /settings after startup to replace them."
@@ -472,15 +494,22 @@ def load_config() -> AssistantConfig | None:
     config: AssistantConfig = {
         "name": data["name"],
         "model": data["model"],
-        "prompt": data["prompt"],
+        "prompt": data.get("prompt", ""),
         "ollama_host": ollama_host,
+        "mcp_servers": data.get("mcp_servers", deepcopy(DEFAULT_MCP_SERVERS)),
+        "skill_states": data.get("skill_states", {}),
     }
-    needs_save = host_needs_save
-    if (
-        "NEVER call recall_past_chat" not in config["prompt"]
-        or "NEVER invent, guess, or fabricate file contents." not in config["prompt"]
-    ):
+    _validate_extension_config(config)
+    needs_save = (
+        host_needs_save
+        or "mcp_servers" not in data
+        or "skill_states" not in data
+    )
+    if not config["prompt"].strip() or "NEVER call recall_past_chat" in config["prompt"]:
         config["prompt"] = DEFAULT_PROMPT
+        needs_save = True
+    elif config["prompt"] != ensure_security_directive(config["prompt"]):
+        config["prompt"] = ensure_security_directive(config["prompt"])
         needs_save = True
     if needs_save:
         save_config(config)
@@ -493,13 +522,52 @@ def save_config(config: AssistantConfig) -> None:
     host = config.get("ollama_host", "").strip()
     saved_config: AssistantConfig = {
         **config,
+        "prompt": ensure_security_directive(config.get("prompt", DEFAULT_PROMPT)),
         "ollama_host": host or default_ollama_host(),
+        "mcp_servers": config.get("mcp_servers", deepcopy(DEFAULT_MCP_SERVERS)),
+        "skill_states": config.get("skill_states", {}),
     }
+    _validate_extension_config(saved_config)
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
-            json.dumps(saved_config, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        path.parent.chmod(0o700)
+        _atomic_write_json(path, saved_config)
     except OSError as error:
         raise RuntimeError(f"Could not save LOA settings at {path}: {error}") from error
+
+
+def _validate_extension_config(config: AssistantConfig) -> None:
+    servers = config.get("mcp_servers")
+    if not isinstance(servers, list):
+        raise ValueError("MCP servers must be a list.")
+    names: set[str] = set()
+    for server in servers:
+        if not isinstance(server, dict):
+            raise ValueError("Each MCP server configuration must be an object.")
+        name = server.get("name")
+        command = server.get("command")
+        arguments = server.get("args")
+        environment = server.get("env")
+        enabled = server.get("enabled")
+        if (
+            not isinstance(name, str)
+            or re.fullmatch(r"[a-zA-Z0-9_-]{1,48}", name) is None
+            or name in names
+            or not isinstance(command, str)
+            or not isinstance(arguments, list)
+            or any(not isinstance(argument, str) for argument in arguments)
+            or not isinstance(environment, dict)
+            or any(
+                not isinstance(key, str) or not isinstance(value, str)
+                for key, value in environment.items()
+            )
+            or not isinstance(enabled, bool)
+        ):
+            raise ValueError(f"MCP server configuration is invalid: {name!r}.")
+        names.add(name)
+    skill_states = config.get("skill_states")
+    if not isinstance(skill_states, dict) or any(
+        not isinstance(name, str) or not isinstance(enabled, bool)
+        for name, enabled in skill_states.items()
+    ):
+        raise ValueError("Skill states must map skill names to enabled flags.")
