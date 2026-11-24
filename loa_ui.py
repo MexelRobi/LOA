@@ -1632,7 +1632,7 @@ class LoaApp(App[None]):
         width: 1fr;
         height: auto;
         content-align: left middle;
-        margin: 0 0 1;
+        margin: 0 0 1 0;
     }
     #status {
         height: 1;
