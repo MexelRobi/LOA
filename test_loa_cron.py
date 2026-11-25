@@ -11,6 +11,7 @@ from loa_cron import (
     get_cron_job_history,
     list_cron_jobs,
     toggle_cron_job,
+    update_cron_job,
 )
 
 
@@ -51,6 +52,43 @@ class CronOneTimeTests(unittest.TestCase):
         self.assertFalse(job["one_time"])
         self.assertFalse(job["run_once"])
         self.assertFalse(job["completed"])
+        self.assertEqual(job["action_type"], "prompt")
+        self.assertTrue(job["auto_approve"])
+
+    def test_create_and_update_persist_action_settings(self):
+        job = create_cron_job(
+            "shell task",
+            "@every 5s",
+            "echo ready",
+            action_type="shell",
+            auto_approve=False,
+        )
+        self.assertEqual(job["action_type"], "shell")
+        self.assertFalse(job["auto_approve"])
+
+        updated = update_cron_job(
+            job["id"],
+            action_type="prompt",
+            auto_approve=True,
+        )
+        self.assertEqual(updated["action_type"], "prompt")
+        self.assertTrue(updated["auto_approve"])
+
+    def test_create_rejects_invalid_action_settings(self):
+        with self.assertRaisesRegex(ValueError, "action_type"):
+            create_cron_job(
+                "invalid",
+                "@every 5s",
+                "echo ready",
+                action_type="diffusion",
+            )
+        with self.assertRaisesRegex(ValueError, "auto_approve"):
+            create_cron_job(
+                "invalid",
+                "@every 5s",
+                "echo ready",
+                auto_approve="yes",
+            )
 
     def test_run_once_alias_is_disabled_and_retains_history_after_success(self):
         job = create_cron_job("single", "@every 5s", "do something", run_once=True)

@@ -46,7 +46,9 @@ def _connect() -> sqlite3.Connection:
                 created_at REAL NOT NULL,
                 next_run REAL NOT NULL,
                 one_time INTEGER NOT NULL DEFAULT 0,
-                completed INTEGER NOT NULL DEFAULT 0
+                completed INTEGER NOT NULL DEFAULT 0,
+                action_type TEXT NOT NULL DEFAULT 'prompt',
+                auto_approve INTEGER NOT NULL DEFAULT 1
             )"""
         )
         columns = {
@@ -60,6 +62,14 @@ def _connect() -> sqlite3.Connection:
         if "completed" not in columns:
             connection.execute(
                 "ALTER TABLE cron_jobs ADD COLUMN completed INTEGER NOT NULL DEFAULT 0"
+            )
+        if "action_type" not in columns:
+            connection.execute(
+                "ALTER TABLE cron_jobs ADD COLUMN action_type TEXT NOT NULL DEFAULT 'prompt'"
+            )
+        if "auto_approve" not in columns:
+            connection.execute(
+                "ALTER TABLE cron_jobs ADD COLUMN auto_approve INTEGER NOT NULL DEFAULT 1"
             )
         connection.execute(
             """CREATE TABLE IF NOT EXISTS cron_history (
@@ -179,6 +189,8 @@ def _job(row: sqlite3.Row) -> dict[str, Any]:
         "one_time": one_time,
         "run_once": one_time,
         "completed": bool(row["completed"]),
+        "action_type": row["action_type"],
+        "auto_approve": bool(row["auto_approve"]),
     }
 
 
@@ -206,12 +218,21 @@ def _normalize_one_time(
     return one_time if one_time is not None else run_once
 
 
+def _validate_action_settings(action_type: str, auto_approve: bool) -> None:
+    if not isinstance(action_type, str) or action_type not in {"prompt", "shell"}:
+        raise ValueError("Cronjob action_type must be prompt or shell.")
+    if not isinstance(auto_approve, bool):
+        raise ValueError("Cronjob auto_approve must be a boolean.")
+
+
 def create_cron_job(
     name: str,
     schedule: str,
     payload: str,
     one_time: bool | None = None,
     run_once: bool | None = None,
+    action_type: str = "prompt",
+    auto_approve: bool = True,
 ) -> dict[str, Any]:
     if not isinstance(name, str) or not isinstance(payload, str):
         raise ValueError("Cronjob name and action must be text.")
@@ -219,6 +240,7 @@ def create_cron_job(
     payload = payload.strip()
     schedule = validate_schedule(schedule)
     one_time = _normalize_one_time(one_time, run_once) or False
+    _validate_action_settings(action_type, auto_approve)
     if not name or len(name) > 80:
         raise ValueError("Cronjob name must contain 1 to 80 characters.")
     if not payload or len(payload) > 4000:
@@ -229,8 +251,9 @@ def create_cron_job(
         with _connect() as connection:
             connection.execute(
                 """INSERT INTO cron_jobs
-                (id, name, schedule, payload, enabled, created_at, next_run, one_time, completed)
-                VALUES (?, ?, ?, ?, 1, ?, ?, ?, 0)""",
+                (id, name, schedule, payload, enabled, created_at, next_run, one_time,
+                 completed, action_type, auto_approve)
+                VALUES (?, ?, ?, ?, 1, ?, ?, ?, 0, ?, ?)""",
                 (
                     job_id,
                     name,
@@ -239,6 +262,8 @@ def create_cron_job(
                     now,
                     _next_run(schedule, now),
                     int(one_time),
+                    action_type,
+                    int(auto_approve),
                 ),
             )
             row = connection.execute("SELECT * FROM cron_jobs WHERE id = ?", (job_id,)).fetchone()
@@ -254,6 +279,8 @@ def update_cron_job(
     payload: str | None = None,
     one_time: bool | None = None,
     run_once: bool | None = None,
+    action_type: str | None = None,
+    auto_approve: bool | None = None,
 ) -> dict[str, Any]:
     if any(value is not None and not isinstance(value, str) for value in (name, schedule, payload)):
         raise ValueError("Cronjob name, schedule, and action must be text.")
@@ -261,6 +288,11 @@ def update_cron_job(
     new_name = (name if name is not None else job["name"]).strip()
     new_schedule = validate_schedule(schedule if schedule is not None else job["schedule"])
     new_payload = (payload if payload is not None else job["payload"]).strip()
+    new_action_type = action_type if action_type is not None else job["action_type"]
+    new_auto_approve = (
+        auto_approve if auto_approve is not None else bool(job["auto_approve"])
+    )
+    _validate_action_settings(new_action_type, new_auto_approve)
     requested_one_time = _normalize_one_time(one_time, run_once)
     new_one_time = (
         bool(job["one_time"])
@@ -278,7 +310,8 @@ def update_cron_job(
         with _connect() as connection:
             connection.execute(
                 """UPDATE cron_jobs
-                SET name=?, schedule=?, payload=?, next_run=?, one_time=?, completed=?
+                SET name=?, schedule=?, payload=?, next_run=?, one_time=?, completed=?,
+                    action_type=?, auto_approve=?
                 WHERE id=?""",
                 (
                     new_name,
@@ -287,6 +320,8 @@ def update_cron_job(
                     next_run,
                     int(new_one_time),
                     int(new_completed),
+                    new_action_type,
+                    int(new_auto_approve),
                     job_id,
                 ),
             )
@@ -384,11 +419,11 @@ class CronScheduler:
         with self._lock:
             self._executor = executor
 
-    def stop(self) -> None:
+    def stop(self, timeout: float = 3) -> None:
         self._stop.set()
         thread = self._thread
         if thread and thread.is_alive():
-            thread.join(timeout=3)
+            thread.join(timeout=timeout)
 
     def run_now(self, job_id: str) -> str:
         row = _get_job_row(job_id)

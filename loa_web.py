@@ -3,15 +3,25 @@
 from __future__ import annotations
 
 import hmac
+import base64
+import binascii
+import io
 import ipaddress
 import json
 import getpass
+import logging
+import os
+import re
 import secrets
+import signal
 import socket
 import subprocess
 import sys
 import threading
 import time
+import uuid
+from contextlib import contextmanager
+from copy import deepcopy
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -29,6 +39,7 @@ from loa_agent import (
     CANCELED_ACTION_RESPONSE,
     action_task,
     configure_runtime_tools,
+    check_image_generation_readiness,
     execute_approved_action,
     format_ollama_error,
     get_assistant_reply,
@@ -73,6 +84,7 @@ from loa_storage import (
     rename_chat_session,
     save_chat_session,
     save_config,
+    generated_images_directory_path,
 )
 from loa_mcp import mcp_manager
 from loa_skills import (
@@ -87,6 +99,10 @@ from loa_skills import (
 
 
 MAX_REQUEST_BYTES = 1_000_000
+MAX_IMAGE_UPLOAD_BYTES = 8_000_000
+WEB_LOCK_TIMEOUT = 0.5
+WEB_RUNTIME_WAIT_TIMEOUT = 3.0
+WEB_SHUTDOWN_TIMEOUT = 0.25
 TAILNET_NETWORKS = (
     ipaddress.ip_network("100.64.0.0/10"),
     ipaddress.ip_network("fd7a:115c:a1e0::/48"),
@@ -144,11 +160,47 @@ def _required_string(payload: dict[str, Any], key: str) -> str:
     return value.strip()
 
 
+def _require_reference_image_editing(config: AssistantConfig) -> None:
+    image_gen = config.get("image_gen", {})
+    if not image_gen.get("enabled", True) or image_gen.get("provider") != "local_flux":
+        raise ValueError("Reference image uploads require enabled image generation with the local FLUX provider.")
+
+
 def _optional_string(payload: dict[str, Any], key: str) -> str | None:
     value = payload.get(key)
     if value is not None and not isinstance(value, str):
         raise ValueError(f"{key.replace('_', ' ').capitalize()} must be text.")
     return value.strip() if isinstance(value, str) else None
+
+
+def _public_image_gen_settings(config: AssistantConfig) -> dict[str, Any]:
+    settings = config.get("image_gen", {})
+    if not isinstance(settings, dict):
+        settings = {}
+    provider = settings.get("provider", "openai")
+    environment_name = (
+        "GEMINI_API_KEY" if provider == "gemini" else "OPENAI_API_KEY"
+    )
+    saved_key = settings.get("api_key", "")
+    return {
+        "enabled": settings.get("enabled", True),
+        "provider": provider,
+        "model": settings.get("model", "gpt-image-1"),
+        "api_key": "",
+        "api_key_configured": bool(
+            (isinstance(saved_key, str) and saved_key.strip())
+            or (
+                provider in {"openai", "gemini"}
+                and os.environ.get(environment_name, "").strip()
+            )
+        ),
+        "size": settings.get("size", "1024x1024"),
+        "quality": settings.get("quality", "high"),
+    }
+
+
+class WebBusyError(RuntimeError):
+    """A request cannot proceed while another operation holds shared state."""
 
 
 class WebChatState:
@@ -157,7 +209,12 @@ class WebChatState:
     def __init__(self, config: AssistantConfig | None) -> None:
         self.config = config or default_config()
         self.configured = config is not None
-        self.mcp_status = configure_runtime_tools(self.config)
+        self.mcp_status: list[dict[str, Any]] = []
+        self._runtime_ready = threading.Event()
+        self._runtime_lifecycle_lock = threading.Lock()
+        self._runtime_started = False
+        self._runtime_stopping = False
+        self._runtime_error: Exception | None = None
         self.lock = threading.RLock()
         self.auth_lock = threading.RLock()
         self.cancellation_lock = threading.Lock()
@@ -170,6 +227,57 @@ class WebChatState:
         self.pending_action: dict[str, Any] | None = None
         self.pending_command: str | None = None
         self.pending_command_reason: str | None = None
+
+    def start_runtime(self) -> None:
+        with self._runtime_lifecycle_lock:
+            if self._runtime_started:
+                raise RuntimeError("The web runtime has already been started.")
+            self._runtime_started = True
+        threading.Thread(
+            target=self._initialize_runtime,
+            name="loa-web-runtime",
+            daemon=True,
+        ).start()
+
+    def _initialize_runtime(self) -> None:
+        try:
+            self.mcp_status = configure_runtime_tools(self.config)
+        except Exception as error:
+            if not self._runtime_stopping:
+                logging.getLogger(__name__).exception("Web runtime initialization failed.")
+                self._runtime_error = error
+        finally:
+            with self._runtime_lifecycle_lock:
+                self._runtime_ready.set()
+
+    def wait_for_runtime(self, timeout: float | None = None) -> None:
+        if not self._runtime_ready.wait(timeout):
+            raise WebBusyError("LOA tools are still starting. Please try again shortly.")
+        if self._runtime_stopping:
+            raise RuntimeError("The web server is stopping.")
+        if self._runtime_error is not None:
+            raise RuntimeError(
+                f"Could not initialize web tools: {self._runtime_error}"
+            ) from self._runtime_error
+
+    @contextmanager
+    def request_lock(self):
+        if not self.lock.acquire(timeout=WEB_LOCK_TIMEOUT):
+            raise WebBusyError(
+                "LOA is busy with another operation. Wait for it to finish or use Break Loop."
+            )
+        try:
+            yield
+        finally:
+            self.lock.release()
+
+    def stop_runtime(self) -> None:
+        with self._runtime_lifecycle_lock:
+            self._runtime_stopping = True
+        with self.cancellation_lock:
+            if self.active_cancellation is not None:
+                self.active_cancellation.event.set()
+        mcp_manager.close(timeout=WEB_SHUTDOWN_TIMEOUT, permanent=True)
 
 
 class LoaHTTPServer(ThreadingHTTPServer):
@@ -213,6 +321,8 @@ class LoaRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         try:
             self._handle_get()
+        except WebBusyError as error:
+            self._send_json({"error": str(error)}, status=503)
         except (OSError, RuntimeError, ValueError) as error:
             self._send_json({"error": str(error)}, status=500)
 
@@ -247,7 +357,31 @@ class LoaRequestHandler(BaseHTTPRequestHandler):
             self._send_json({"error": "Unauthorized"}, status=401)
             return
 
-        with self.server.state.lock:
+        if path.startswith("/api/images/"):
+            image_match = re.fullmatch(r"/api/images/([a-f0-9]{32}\.png)", path)
+            if image_match is None:
+                self._send_json({"error": "Not found"}, status=404)
+                return
+            image_path = generated_images_directory_path() / image_match.group(1)
+            try:
+                content = image_path.read_bytes()
+            except FileNotFoundError:
+                self._send_json({"error": "Not found"}, status=404)
+                return
+            except OSError as error:
+                self._send_json(
+                    {"error": f"Could not read generated image: {error}"},
+                    status=500,
+                )
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "image/png")
+            self.send_header("Content-Length", str(len(content)))
+            self.end_headers()
+            self.wfile.write(content)
+            return
+
+        with self.server.state.request_lock():
             if path == "/api/chats":
                 self._send_json(
                     {
@@ -281,6 +415,7 @@ class LoaRequestHandler(BaseHTTPRequestHandler):
                         "model": state.config["model"],
                         "prompt": state.config["prompt"],
                         "ollama_host": state.config["ollama_host"],
+                        "image_gen": _public_image_gen_settings(state.config),
                         "mcp_servers": state.config.get("mcp_servers", []),
                         "skill_states": state.config.get("skill_states", {}),
                         "skills": list_user_skills(state.config.get("skill_states", {})),
@@ -328,8 +463,10 @@ class LoaRequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         try:
-            payload = self._read_json()
             path = urlsplit(self.path).path
+            payload = self._read_json(
+                limit=12_000_000 if path == "/api/images/upload" else MAX_REQUEST_BYTES
+            )
             if path == "/auth/login":
                 self._login(payload)
                 return
@@ -339,10 +476,20 @@ class LoaRequestHandler(BaseHTTPRequestHandler):
                     return
                 self._break_loop()
                 return
-            with self.server.state.lock:
-                if not self._authorized():
-                    self._send_json({"error": "Unauthorized"}, status=401)
-                    return
+            if not self._authorized():
+                self._send_json({"error": "Unauthorized"}, status=401)
+                return
+            if path == "/api/image-gen/check":
+                with self.server.state.request_lock():
+                    config = deepcopy(self.server.state.config)
+                self._check_image_generation(payload, config)
+                return
+            if path in {
+                "/api/settings", "/api/skills", "/api/mcp", "/api/chat",
+                "/api/command", "/api/cronjobs",
+            }:
+                self.server.state.wait_for_runtime(timeout=WEB_RUNTIME_WAIT_TIMEOUT)
+            with self.server.state.request_lock():
                 if path == "/auth/logout":
                     self._logout()
                 elif path == "/api/chats":
@@ -361,12 +508,21 @@ class LoaRequestHandler(BaseHTTPRequestHandler):
                     self._handle_cronjobs(payload)
                 elif path == "/api/chat":
                     self._send_message(payload)
+                elif path == "/api/images/upload":
+                    self._upload_reference_image(payload)
                 elif path == "/api/command":
                     self._handle_command(payload)
                 else:
                     self._send_json({"error": "Not found"}, status=404)
+        except WebBusyError as error:
+            self._send_json({"error": str(error)}, status=503)
         except (ValueError, UnicodeDecodeError, json.JSONDecodeError) as error:
             self._send_json({"error": str(error)}, status=400)
+        except httpx.HTTPError as error:
+            self._send_json(
+                {"error": f"Image generation connection check failed: {error}"},
+                status=502,
+            )
         except RuntimeError as error:
             self._send_json({"error": str(error)}, status=500)
 
@@ -442,7 +598,7 @@ class LoaRequestHandler(BaseHTTPRequestHandler):
                     self.server.state.sessions.pop(value, None)
         self._send_json({"ok": True}, clear_cookie=True)
 
-    def _read_json(self) -> dict[str, Any]:
+    def _read_json(self, limit: int = MAX_REQUEST_BYTES) -> dict[str, Any]:
         raw_length = self.headers.get("Content-Length")
         if raw_length is None:
             raise ValueError("Content-Length is required.")
@@ -450,12 +606,48 @@ class LoaRequestHandler(BaseHTTPRequestHandler):
             length = int(raw_length)
         except ValueError as error:
             raise ValueError("Invalid Content-Length.") from error
-        if length < 0 or length > MAX_REQUEST_BYTES:
+        if length < 0 or length > limit:
             raise ValueError("Request body is too large.")
         payload = json.loads(self.rfile.read(length).decode("utf-8"))
         if not isinstance(payload, dict):
             raise ValueError("A JSON object is required.")
         return payload
+
+    def _upload_reference_image(self, payload: dict[str, Any]) -> None:
+        _require_reference_image_editing(self.server.state.config)
+        from PIL import Image, ImageOps, UnidentifiedImageError
+
+        encoded = payload.get("data")
+        if not isinstance(encoded, str):
+            raise ValueError("An encoded reference image is required.")
+        try:
+            data = base64.b64decode(encoded, validate=True)
+        except (ValueError, binascii.Error) as error:
+            raise ValueError("Invalid reference image data.") from error
+        if not data or len(data) > MAX_IMAGE_UPLOAD_BYTES:
+            raise ValueError("Reference image must be at most 8 MB.")
+        try:
+            with Image.open(io.BytesIO(data)) as image:
+                if image.format not in {"PNG", "JPEG", "WEBP"}:
+                    raise ValueError("Reference image must be PNG, JPEG, or WebP.")
+                if image.width * image.height > 16_000_000:
+                    raise ValueError("Reference image exceeds 16 megapixels.")
+                image.load()
+                converted = ImageOps.exif_transpose(image).convert("RGB")
+        except (UnidentifiedImageError, OSError, Image.DecompressionBombError) as error:
+            raise ValueError(f"Invalid reference image: {error}") from error
+        directory = generated_images_directory_path()
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        filename = f"{uuid.uuid4().hex}.png"
+        path = directory / filename
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        try:
+            with os.fdopen(fd, "wb") as file:
+                converted.save(file, format="PNG")
+        except BaseException:
+            path.unlink(missing_ok=True)
+            raise
+        self._send_json({"filename": filename, "image_url": f"/api/images/{filename}"})
 
     def _save_settings(self, payload: dict[str, Any]) -> None:
         state = self.server.state
@@ -475,11 +667,51 @@ class LoaRequestHandler(BaseHTTPRequestHandler):
             if isinstance(host_value, str) and host_value.strip()
             else default_ollama_host()
         )
+        current_image_gen = state.config.get("image_gen", {})
+        if not isinstance(current_image_gen, dict):
+            current_image_gen = {}
+        image_gen_payload = payload.get("image_gen", current_image_gen)
+        if not isinstance(image_gen_payload, dict):
+            raise ValueError("Image generation settings must be an object.")
+        api_key = image_gen_payload.get("api_key", "")
+        clear_api_key = image_gen_payload.get("clear_api_key", False)
+        if not isinstance(api_key, str) or not isinstance(clear_api_key, bool):
+            raise ValueError("Image generation API key settings are invalid.")
+        saved_api_key = (
+            ""
+            if clear_api_key
+            else api_key.strip()
+            or str(current_image_gen.get("api_key", ""))
+        )
+        image_gen = {
+            "enabled": image_gen_payload.get(
+                "enabled",
+                current_image_gen.get("enabled", True),
+            ),
+            "provider": image_gen_payload.get(
+                "provider",
+                current_image_gen.get("provider", "openai"),
+            ),
+            "model": image_gen_payload.get(
+                "model",
+                current_image_gen.get("model", "gpt-image-1"),
+            ),
+            "api_key": saved_api_key,
+            "size": image_gen_payload.get(
+                "size",
+                current_image_gen.get("size", "1024x1024"),
+            ),
+            "quality": image_gen_payload.get(
+                "quality",
+                current_image_gen.get("quality", "high"),
+            ),
+        }
         assistant_config: AssistantConfig = {
             "name": config["name"].strip(),
             "model": config["model"].strip(),
             "prompt": config["prompt"].strip(),
             "ollama_host": ollama_host,
+            "image_gen": image_gen,
             "mcp_servers": payload.get(
                 "mcp_servers",
                 state.config.get("mcp_servers", []),
@@ -489,11 +721,13 @@ class LoaRequestHandler(BaseHTTPRequestHandler):
                 state.config.get("skill_states", {}),
             ),
         }
+        mcp_changed = assistant_config["mcp_servers"] != state.config.get("mcp_servers", [])
         save_config(assistant_config)
         reload_skill_modules()
         state.mcp_status = configure_runtime_tools(
             assistant_config,
-            force_mcp_reload=True,
+            force_mcp_reload=mcp_changed,
+            reuse_mcp_connections=not mcp_changed,
         )
         state.config = assistant_config
         state.configured = True
@@ -511,10 +745,34 @@ class LoaRequestHandler(BaseHTTPRequestHandler):
             {
                 "ok": True,
                 "name": assistant_config["name"],
+                "image_gen": _public_image_gen_settings(assistant_config),
                 "mcp_status": state.mcp_status,
                 "skills": list_user_skills(assistant_config["skill_states"]),
             }
         )
+
+    def _check_image_generation(
+        self, payload: dict[str, Any], config: AssistantConfig
+    ) -> None:
+        settings = dict(config.get("image_gen", {}))
+        submitted = payload.get("image_gen")
+        if submitted is not None:
+            if not isinstance(submitted, dict):
+                raise ValueError("Image generation settings must be an object.")
+            if submitted.get("clear_api_key") is True:
+                settings["api_key"] = ""
+            elif isinstance(submitted.get("api_key"), str) and submitted["api_key"].strip():
+                settings["api_key"] = submitted["api_key"].strip()
+            settings.update(
+                {
+                    key: submitted[key]
+                    for key in ("enabled", "provider", "model", "size", "quality")
+                    if key in submitted
+                }
+            )
+        config["image_gen"] = settings
+        message = check_image_generation_readiness(config)
+        self._send_json({"ok": True, "message": message})
 
     def _handle_skills(self, payload: dict[str, Any]) -> None:
         state = self.server.state
@@ -652,6 +910,8 @@ class LoaRequestHandler(BaseHTTPRequestHandler):
                 _required_string(payload, "payload"),
                 one_time=payload.get("one_time"),
                 run_once=payload.get("run_once"),
+                action_type=payload.get("action_type", "prompt"),
+                auto_approve=payload.get("auto_approve", True),
             )
         elif operation == "update":
             job_id = _required_string(payload, "job_id")
@@ -662,6 +922,8 @@ class LoaRequestHandler(BaseHTTPRequestHandler):
                 payload=_optional_string(payload, "payload"),
                 one_time=payload.get("one_time"),
                 run_once=payload.get("run_once"),
+                action_type=_optional_string(payload, "action_type"),
+                auto_approve=payload.get("auto_approve"),
             )
         elif operation == "toggle":
             enabled = payload.get("enabled")
@@ -910,6 +1172,16 @@ class LoaRequestHandler(BaseHTTPRequestHandler):
             raise ValueError("Approve or cancel the pending action first.")
 
         text = text.strip()
+        reference = payload.get("image_filename")
+        if reference is not None:
+            _require_reference_image_editing(state.config)
+            if (
+                not isinstance(reference, str)
+                or re.fullmatch(r"[a-f0-9]{32}\.png", reference) is None
+                or not (generated_images_directory_path() / reference).is_file()
+            ):
+                raise ValueError("Invalid reference image.")
+            text += f"\n[Reference image for editing: {reference}]"
         skill = resolve_skill_command(text, state.config.get("skill_states", {}))
         if state.session is None:
             self._activate_chat(new_chat_session(), persist=False)
@@ -921,7 +1193,10 @@ class LoaRequestHandler(BaseHTTPRequestHandler):
                 state.session["id"],
                 state.config.get("skill_states", {}),
             )
-        state.messages.append({"role": "user", "content": text})
+        user_message = {"role": "user", "content": text}
+        if reference is not None:
+            user_message["ui"] = {"type": "reference_image", "filename": reference}
+        state.messages.append(user_message)
         state.transcript.append({"role": "user", "content": text})
         _save_active_chat(state)
         cancellation = self._begin_operation()
@@ -950,6 +1225,7 @@ class LoaRequestHandler(BaseHTTPRequestHandler):
             httpx.HTTPError,
             DDGSException,
             OSError,
+            RuntimeError,
             ValueError,
         ) as error:
             state.messages.pop()
@@ -1245,31 +1521,58 @@ def run_web_server(
 
     if bool(certfile) != bool(keyfile):
         raise ValueError("Both a TLS certificate and private key are required for HTTPS.")
-    state = WebChatState(config)
-    server = LoaHTTPServer((host, port), LoaRequestHandler, state, secure=bool(certfile))
-    scheme = "https" if certfile else "http"
-    if certfile and keyfile:
-        import ssl
-
-        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-        context.load_cert_chain(certfile=certfile, keyfile=keyfile)
-        server.socket = context.wrap_socket(server.socket, server_side=True)
-    actual_port = server.server_address[1]
-    print(f"LOA web chat is listening on port {actual_port}.")
-    print("Open one of these addresses on your phone or computer on the same Wi-Fi network:")
-    addresses = ["127.0.0.1"]
-    if host == "0.0.0.0":
-        local_address = lan_ip_address()
-        if local_address is not None:
-            addresses.append(local_address)
-        if not certfile:
-            print("This server uses unencrypted HTTP. Only use it on a trusted private network.")
-    for address in addresses:
-        url = f"{scheme}://{address}:{actual_port}/"
-        print(f"  {url}")
-    cron_scheduler.start(lambda job: run_scheduled_prompt(state.config, job))
+    server: LoaHTTPServer | None = None
+    state: WebChatState | None = None
+    restore_sigterm = threading.current_thread() is threading.main_thread()
+    previous_sigterm_handler = (
+        signal.getsignal(signal.SIGTERM) if restore_sigterm else None
+    )
+    if restore_sigterm:
+        signal.signal(signal.SIGTERM, signal.default_int_handler)
     try:
+        state = WebChatState(config)
+        server = LoaHTTPServer((host, port), LoaRequestHandler, state, secure=bool(certfile))
+        scheme = "https" if certfile else "http"
+        if certfile and keyfile:
+            import ssl
+
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            context.load_cert_chain(certfile=certfile, keyfile=keyfile)
+            server.socket = context.wrap_socket(server.socket, server_side=True)
+        actual_port = server.server_address[1]
+        print(f"LOA web chat is listening on port {actual_port}.")
+        print("Open one of these addresses on your phone or computer on the same Wi-Fi network:")
+        addresses = ["127.0.0.1"]
+        if host == "0.0.0.0":
+            local_address = lan_ip_address()
+            if local_address is not None:
+                addresses.append(local_address)
+            if not certfile:
+                print("This server uses unencrypted HTTP. Only use it on a trusted private network.")
+        for address in addresses:
+            url = f"{scheme}://{address}:{actual_port}/"
+            print(f"  {url}")
+        state.start_runtime()
+
+        def run_scheduled_job(job: dict[str, Any]) -> str:
+            state.wait_for_runtime()
+            return run_scheduled_prompt(state.config, job)
+
+        cron_scheduler.start(run_scheduled_job)
         server.serve_forever()
     finally:
-        cron_scheduler.stop()
-        server.server_close()
+        try:
+            cron_scheduler.stop(timeout=WEB_SHUTDOWN_TIMEOUT)
+        finally:
+            try:
+                if server is not None:
+                    server.server_close()
+            finally:
+                try:
+                    if state is not None:
+                        state.stop_runtime()
+                    else:
+                        mcp_manager.close(timeout=WEB_SHUTDOWN_TIMEOUT, permanent=True)
+                finally:
+                    if restore_sigterm:
+                        signal.signal(signal.SIGTERM, previous_sigterm_handler)

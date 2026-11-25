@@ -3,9 +3,6 @@
 import argparse
 
 from loa_storage import load_config
-from loa_service import install_web_service, uninstall_web_service, web_service_status
-from loa_ui import LoaApp
-from loa_web import lan_ip_address, run_web_server
 
 
 def main() -> int:
@@ -75,6 +72,8 @@ def main() -> int:
         return 1
 
     if args.install_web_service:
+        from loa_service import install_web_service
+
         try:
             plist_path = install_web_service(
                 host=args.host,
@@ -87,12 +86,16 @@ def main() -> int:
             return 1
         print(f"LOA web background service installed and started: {plist_path}")
         print("It will start automatically when you sign in.")
+        from loa_web import lan_ip_address
+
         service_host = args.host
         if service_host == "0.0.0.0":
             service_host = lan_ip_address() or "127.0.0.1"
         scheme = "https" if args.certfile else "http"
         print(f"Open {scheme}://{service_host}:{args.port}/ on a device on the same network.")
     elif args.uninstall_web_service:
+        from loa_service import uninstall_web_service
+
         try:
             if uninstall_web_service():
                 print("LOA web background service stopped and removed.")
@@ -102,13 +105,18 @@ def main() -> int:
             print(f"Could not remove the LOA web background service: {error}")
             return 1
     elif args.web_service_status:
+        from loa_service import web_service_status
+
         try:
             print(web_service_status())
         except (OSError, RuntimeError, ValueError) as error:
             print(f"Could not check the LOA web background service: {error}")
             return 1
     elif args.web:
+        print("Loading web server dependencies...", flush=True)
         try:
+            from loa_web import run_web_server
+
             run_web_server(
                 config,
                 host=args.host,
@@ -119,10 +127,12 @@ def main() -> int:
             )
         except KeyboardInterrupt:
             print("\nWeb chat stopped.")
-        except (OSError, RuntimeError, ValueError) as error:
+        except (ImportError, OSError, RuntimeError, ValueError) as error:
             print(f"Could not start the web server: {error}")
             return 1
     else:
+        from loa_ui import LoaApp
+
         LoaApp(config).run()
     return 0
 

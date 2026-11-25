@@ -301,6 +301,86 @@ select:focus-visible {
   color: #d0d4d8;
 }
 
+.image-message {
+  white-space: normal;
+}
+
+.generated-image-card {
+  display: grid;
+  width: fit-content;
+  max-width: min(100%, 620px);
+  gap: 7px;
+  margin: 8px 0;
+  padding: 8px;
+  border: 1px solid #3a3f46;
+  border-radius: 5px;
+  background: #202327;
+}
+
+.image-preview {
+  display: block;
+  min-height: 0;
+  max-width: 100%;
+  padding: 0;
+  overflow: hidden;
+  border: 0;
+  background: transparent;
+}
+
+.image-preview:hover:not(:disabled) {
+  border: 0;
+  background: transparent;
+}
+
+.image-preview img {
+  display: block;
+  width: auto;
+  max-width: 100%;
+  max-height: 62vh;
+  border-radius: 3px;
+  object-fit: contain;
+}
+
+.image-caption {
+  margin: 0;
+  color: #d4d8dc;
+  font: 0.8rem/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  white-space: pre-wrap;
+}
+
+.image-provider {
+  color: var(--muted);
+}
+
+.image-download {
+  width: fit-content;
+  padding: 7px 10px;
+  text-decoration: none;
+}
+
+.image-lightbox {
+  width: min(96vw, 1500px);
+  max-width: 96vw;
+  max-height: 96vh;
+  padding: 10px;
+  border: 1px solid #59616a;
+  border-radius: 5px;
+  background: #17191c;
+  color: #e2e5e8;
+}
+
+.image-lightbox::backdrop {
+  background: rgb(0 0 0 / 82%);
+}
+
+.image-lightbox img {
+  display: block;
+  max-width: 100%;
+  max-height: 88vh;
+  margin: 8px auto 0;
+  object-fit: contain;
+}
+
 .sources {
   display: grid;
   gap: 2px;
@@ -436,6 +516,53 @@ textarea {
 
 .quiet-button {
   color: #d4d8dc;
+}
+
+.reference-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 36px;
+  max-width: 200px;
+  padding: 0 12px;
+  border: 1px solid #494f58;
+  border-radius: 9px;
+  background: #252a30;
+  color: #e2e6eb;
+  font-size: 13px;
+  cursor: pointer;
+  transition: background 140ms, border-color 140ms;
+}
+
+.reference-button:not(.reference-disabled):hover {
+  border-color: #8c99a9;
+  background: #303740;
+}
+
+.reference-button span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.reference-button svg {
+  flex: none;
+}
+
+#reference-image:focus-visible + .reference-button {
+  outline: 2px solid #aebdd0;
+  outline-offset: 2px;
+}
+
+.reference-button.reference-disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.reference-clear {
+  min-width: 30px;
+  padding: 0 7px;
+  font-size: 18px;
 }
 
 .primary-button:hover:not(:disabled) {
@@ -924,6 +1051,26 @@ textarea {
 .extension-settings .prompt-actions,
 .extension-settings .status {
   grid-column: 1 / -1;
+}
+
+.image-gen-enabled,
+.image-gen-clear-key {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.image-gen-enabled input,
+.image-gen-clear-key input {
+  width: auto;
+  margin: 0;
+}
+
+.image-gen-actions {
+  display: flex;
+  flex-wrap: wrap;
+  grid-column: 1 / -1;
+  gap: 5px;
 }
 
 .extension-settings button {

@@ -13,6 +13,10 @@ from typing import Any, TypedDict
 
 from loa_config import (
     AssistantConfig,
+    DEFAULT_IMAGE_GEN_CONFIG,
+    DEFAULT_FLUX_MODEL,
+    DEFAULT_JANUS_MODEL,
+    DEFAULT_SANA_MODEL,
     DEFAULT_MCP_SERVERS,
     DEFAULT_PROMPT,
     default_ollama_host,
@@ -57,6 +61,11 @@ def chats_index_path() -> Path:
 def skills_directory_path() -> Path:
     """Return the user's installed LOA skills directory."""
     return Path.home() / ".loa" / "skills"
+
+
+def generated_images_directory_path() -> Path:
+    """Return the private directory that stores generated image files."""
+    return Path.home() / ".loa" / "generated_images"
 
 
 def ensure_skills_directory() -> Path:
@@ -496,12 +505,14 @@ def load_config() -> AssistantConfig | None:
         "model": data["model"],
         "prompt": data.get("prompt", ""),
         "ollama_host": ollama_host,
+        "image_gen": _normalize_image_gen_config(data.get("image_gen")),
         "mcp_servers": data.get("mcp_servers", deepcopy(DEFAULT_MCP_SERVERS)),
         "skill_states": data.get("skill_states", {}),
     }
     _validate_extension_config(config)
     needs_save = (
         host_needs_save
+        or "image_gen" not in data
         or "mcp_servers" not in data
         or "skill_states" not in data
     )
@@ -524,6 +535,7 @@ def save_config(config: AssistantConfig) -> None:
         **config,
         "prompt": ensure_security_directive(config.get("prompt", DEFAULT_PROMPT)),
         "ollama_host": host or default_ollama_host(),
+        "image_gen": _normalize_image_gen_config(config.get("image_gen")),
         "mcp_servers": config.get("mcp_servers", deepcopy(DEFAULT_MCP_SERVERS)),
         "skill_states": config.get("skill_states", {}),
     }
@@ -537,6 +549,29 @@ def save_config(config: AssistantConfig) -> None:
 
 
 def _validate_extension_config(config: AssistantConfig) -> None:
+    image_gen = config.get("image_gen")
+    if not isinstance(image_gen, dict):
+        raise ValueError("Image generation settings must be an object.")
+    if not isinstance(image_gen.get("enabled"), bool):
+        raise ValueError("Image generation enabled must be a boolean.")
+    provider = image_gen.get("provider")
+    if not isinstance(provider, str) or provider not in {
+        "openai", "gemini", "local_janus", "local_flux", "local_sana"
+    }:
+        raise ValueError("Invalid image generation provider.")
+    if not isinstance(image_gen.get("model"), str) or not image_gen["model"].strip():
+        raise ValueError("Image generation model must not be empty.")
+    if not isinstance(image_gen.get("api_key"), str):
+        raise ValueError("Image generation API key must be text.")
+    if not isinstance(image_gen.get("size"), str) or image_gen["size"] not in {
+        "1024x1024", "1536x1024", "1024x1536"
+    }:
+        raise ValueError("Image generation size is not supported.")
+    if not isinstance(image_gen.get("quality"), str) or image_gen["quality"] not in {
+        "low", "medium", "high"
+    }:
+        raise ValueError("Image generation quality must be low, medium, or high.")
+
     servers = config.get("mcp_servers")
     if not isinstance(servers, list):
         raise ValueError("MCP servers must be a list.")
@@ -571,3 +606,32 @@ def _validate_extension_config(config: AssistantConfig) -> None:
         for name, enabled in skill_states.items()
     ):
         raise ValueError("Skill states must map skill names to enabled flags.")
+
+
+def _normalize_image_gen_config(value: object) -> dict[str, object]:
+    defaults = deepcopy(DEFAULT_IMAGE_GEN_CONFIG)
+    if value is None:
+        return defaults
+    if not isinstance(value, dict):
+        raise ValueError("Image generation settings must be an object.")
+    provider = value.get("provider", defaults["provider"])
+    model_defaults = {
+        "openai": "gpt-image-1",
+        "gemini": "gemini-2.5-flash-image",
+        "local_janus": DEFAULT_JANUS_MODEL,
+        "local_flux": DEFAULT_FLUX_MODEL,
+        "local_sana": DEFAULT_SANA_MODEL,
+    }
+    if not isinstance(provider, str) or provider not in model_defaults:
+        raise ValueError("Invalid image generation provider.")
+    defaults.update(
+        {
+            "provider": provider,
+            "model": value.get("model", model_defaults[provider]),
+            "enabled": value.get("enabled", True),
+            "api_key": value.get("api_key", ""),
+            "size": value.get("size", "1024x1024"),
+            "quality": value.get("quality", "high"),
+        }
+    )
+    return defaults

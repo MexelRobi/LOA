@@ -6,15 +6,14 @@ import asyncio
 import atexit
 import concurrent.futures
 import json
+import logging
 import os
 import re
+import tempfile
 import threading
 import time
 from pathlib import Path
 from typing import Any
-
-from mcp import ClientSession, StdioServerParameters
-from mcp.client.stdio import stdio_client
 
 _READ_ONLY_TOOL_VERBS = (
     "list",
@@ -71,6 +70,29 @@ _PATH_ARGUMENT_NAMES = frozenset(
     {"path", "file", "file_path", "filepath", "filename"}
 )
 _PLAYWRIGHT_PACKAGE = "@playwright/mcp"
+_MCP_SHUTDOWN_TIMEOUT = 5.0
+# MCP creates a separate process group; its watchdog stops that group on LOA shutdown.
+_MCP_PARENT_WATCHDOG = """
+owner=$1
+marker=$2
+shift 2
+group=$$
+(
+    while kill -0 "$owner" 2>/dev/null && [ ! -s "$marker" ]; do /bin/sleep 0.05; done
+    trap '' TERM
+    kill -TERM -- "-$group" 2>/dev/null
+    /bin/sleep 0.1
+    /bin/rm -f -- "$marker"
+    kill -KILL -- "-$group" 2>/dev/null
+) </dev/null >/dev/null 2>&1 &
+watchdog=$!
+"$@"
+status=$?
+kill "$watchdog" 2>/dev/null
+wait "$watchdog" 2>/dev/null
+/bin/rm -f -- "$marker"
+exit "$status"
+"""
 
 
 def _playwright_working_directory() -> Path:
@@ -152,8 +174,12 @@ class MCPManager:
 
     def __init__(self) -> None:
         self._lock = threading.RLock()
+        self._close_lock = threading.Lock()
         self._loop: asyncio.AbstractEventLoop | None = None
         self._loop_thread: threading.Thread | None = None
+        self._shutdown_incomplete = False
+        self._shutdown_requested = False
+        self._stop_markers: set[str] = set()
         self._tasks: dict[str, concurrent.futures.Future[None]] = {}
         self._connections: dict[str, ClientSession] = {}
         self._schemas: list[dict[str, Any]] = []
@@ -166,6 +192,8 @@ class MCPManager:
         """Connect to enabled servers only when the saved configuration changes."""
         signature = json.dumps(servers, sort_keys=True, ensure_ascii=False)
         with self._lock:
+            if self._shutdown_requested:
+                raise RuntimeError("The MCP manager is shutting down.")
             configured = self._configuration == signature and all(
                 not server["enabled"]
                 or self._statuses.get(server["name"], {}).get("status") == "Connected"
@@ -177,6 +205,8 @@ class MCPManager:
         """Disconnect old servers and reconnect enabled server configurations."""
         signature = json.dumps(servers, sort_keys=True, ensure_ascii=False)
         with self._lock:
+            if self._shutdown_requested:
+                raise RuntimeError("The MCP manager is shutting down.")
             self._generation += 1
             generation = self._generation
             old_tasks = list(self._tasks.values())
@@ -213,11 +243,13 @@ class MCPManager:
                 self._set_status(server["name"], generation, "Needs configuration", issue)
                 continue
             ready = threading.Event()
-            future = asyncio.run_coroutine_threadsafe(
-                self._serve_server(server, generation, ready),
-                self._loop,
-            )
             with self._lock:
+                if self._shutdown_requested:
+                    raise RuntimeError("The MCP manager is shutting down.")
+                future = asyncio.run_coroutine_threadsafe(
+                    self._serve_server(server, generation, ready),
+                    self._loop,
+                )
                 if generation == self._generation:
                     self._tasks[server["name"]] = future
             if not ready.wait(timeout=15):
@@ -310,23 +342,97 @@ class MCPManager:
             raise RuntimeError(self._format_result(result) or f"MCP tool failed: {name}")
         return self._format_result(result)
 
-    def close(self) -> None:
+    def close(
+        self, *, timeout: float | None = None, permanent: bool = False
+    ) -> None:
         """Stop all connected stdio servers and the manager's event-loop thread."""
+        timeout = _MCP_SHUTDOWN_TIMEOUT if timeout is None else timeout
         with self._lock:
-            loop = self._loop
-            thread = self._loop_thread
-        if loop is None or not loop.is_running():
+            if self._shutdown_requested and not permanent:
+                return
+            if permanent:
+                self._shutdown_requested = True
+                markers = tuple(self._stop_markers)
+            else:
+                markers = ()
+        for marker in markers:
+            try:
+                Path(marker).write_text("stop", encoding="ascii")
+            except OSError as error:
+                logging.getLogger(__name__).warning(
+                    "Could not signal MCP process shutdown: %s", error
+                )
+        if not self._close_lock.acquire(timeout=min(timeout, 1)):
+            logging.getLogger(__name__).warning("MCP shutdown is already in progress.")
             return
-        self.reload([])
-        loop.call_soon_threadsafe(loop.stop)
-        if thread is not None:
-            thread.join(timeout=3)
-        with self._lock:
-            self._loop = None
-            self._loop_thread = None
+        try:
+            with self._lock:
+                loop = self._loop
+                thread = self._loop_thread
+                if self._shutdown_incomplete or loop is None or not loop.is_running():
+                    return
+                self._generation += 1
+                tasks = list(self._tasks.values())
+                self._tasks.clear()
+                self._connections.clear()
+                self._schemas.clear()
+                self._tool_map.clear()
+                self._statuses.clear()
+                self._configuration = None
+
+            for task in tasks:
+                task.cancel()
+
+            async def cancel_pending_tasks() -> None:
+                current_task = asyncio.current_task()
+                pending = [
+                    task for task in asyncio.all_tasks()
+                    if task is not current_task
+                ]
+                for task in pending:
+                    if not task.cancelling():
+                        task.cancel()
+                if pending:
+                    _, unfinished = await asyncio.wait(
+                        pending, timeout=timeout
+                    )
+                    if unfinished:
+                        logging.getLogger(__name__).warning(
+                            "MCP shutdown timed out with %d pending tasks; "
+                            "server subprocesses may still be running.",
+                            len(unfinished),
+                        )
+
+            shutdown = asyncio.run_coroutine_threadsafe(cancel_pending_tasks(), loop)
+            try:
+                shutdown.result(timeout=timeout + 0.1)
+            except concurrent.futures.TimeoutError:
+                shutdown.cancel()
+                logging.getLogger(__name__).warning(
+                    "MCP event loop did not finish shutting down in time."
+                )
+            loop.call_soon_threadsafe(loop.stop)
+            if thread is not None:
+                thread.join(timeout=min(timeout, 1))
+            with self._lock:
+                if thread is not None and thread.is_alive():
+                    self._shutdown_incomplete = True
+                    logging.getLogger(__name__).warning(
+                        "MCP event-loop thread did not stop; it will exit with LOA."
+                    )
+                    return
+                loop.close()
+                self._loop = None
+                self._loop_thread = None
+        finally:
+            self._close_lock.release()
 
     def _ensure_loop(self) -> None:
         with self._lock:
+            if self._shutdown_requested:
+                raise RuntimeError("The MCP manager is shutting down.")
+            if self._shutdown_incomplete:
+                raise RuntimeError("The previous MCP event loop did not shut down.")
             if self._loop is not None and self._loop.is_running():
                 return
             loop = asyncio.new_event_loop()
@@ -356,14 +462,32 @@ class MCPManager:
             **os.environ,
             **{key: value for key, value in server["env"].items() if value},
         }
+        marker: str | None = None
         try:
+            from mcp import ClientSession, StdioServerParameters
+            from mcp.client.stdio import stdio_client
+
             args = server["args"]
             working_directory = None
             if _is_playwright_server(server):
                 working_directory = _playwright_working_directory()
                 args = _playwright_arguments(args, working_directory)
+            command = server["command"]
+            if os.name == "posix":
+                descriptor, marker = tempfile.mkstemp(prefix="loa-mcp-")
+                os.close(descriptor)
+                with self._lock:
+                    if self._shutdown_requested:
+                        Path(marker).unlink(missing_ok=True)
+                        raise RuntimeError("The MCP manager is shutting down.")
+                    self._stop_markers.add(marker)
+                args = [
+                    "-c", _MCP_PARENT_WATCHDOG, "loa-mcp", str(os.getpid()),
+                    marker, command, *args,
+                ]
+                command = "/bin/sh"
             parameters = StdioServerParameters(
-                command=server["command"],
+                command=command,
                 args=args,
                 env=env,
                 cwd=working_directory,
@@ -418,6 +542,10 @@ class MCPManager:
             ready.set()
         finally:
             with self._lock:
+                if marker is not None:
+                    self._stop_markers.discard(marker)
+                    if not self._shutdown_requested:
+                        Path(marker).unlink(missing_ok=True)
                 if generation == self._generation:
                     was_connected = (
                         self._statuses.get(name, {}).get("status") == "Connected"

@@ -24,6 +24,10 @@ const elements = {
   messages: document.querySelector("#messages"),
   chatForm: document.querySelector("#chat-form"),
   messageInput: document.querySelector("#message-input"),
+  referenceImage: document.querySelector("#reference-image"),
+  referenceImageLabel: document.querySelector("#reference-image-label"),
+  referenceImageName: document.querySelector("#reference-image-name"),
+  referenceImageClear: document.querySelector("#reference-image-clear"),
   skillCommandHints: document.querySelector("#skill-command-hints"),
   sendButton: document.querySelector("#send-button"),
   breakLoopButton: document.querySelector("#break-loop-button"),
@@ -51,6 +55,19 @@ const elements = {
   assistantName: document.querySelector("#assistant-name"),
   modelName: document.querySelector("#model-name"),
   ollamaHost: document.querySelector("#ollama-host"),
+  imageGenEnabled: document.querySelector("#image-gen-enabled"),
+  imageGenProvider: document.querySelector("#image-gen-provider"),
+  imageGenModel: document.querySelector("#image-gen-model"),
+  imageGenApiKey: document.querySelector("#image-gen-api-key"),
+  imageGenKeyStatus: document.querySelector("#image-gen-key-status"),
+  imageGenClearKey: document.querySelector("#image-gen-clear-key"),
+  imageGenSize: document.querySelector("#image-gen-size"),
+  imageGenQuality: document.querySelector("#image-gen-quality"),
+  imageGenCheck: document.querySelector("#image-gen-check"),
+  imageGenStatus: document.querySelector("#image-gen-status"),
+  imageLightbox: document.querySelector("#image-lightbox"),
+  imageLightboxImage: document.querySelector("#image-lightbox-image"),
+  imageLightboxClose: document.querySelector("#image-lightbox-close"),
   systemPrompt: document.querySelector("#system-prompt"),
   mcpServers: document.querySelector("#mcp-servers"),
   mcpControls: document.querySelector("#mcp-controls"),
@@ -88,6 +105,8 @@ const elements = {
   cronName: document.querySelector("#cron-name"),
   cronSchedule: document.querySelector("#cron-schedule"),
   cronPayload: document.querySelector("#cron-payload"),
+  cronActionType: document.querySelector("#cron-action-type"),
+  cronAutoApprove: document.querySelector("#cron-auto-approve"),
   cronOneTime: document.querySelector("#cron-one-time"),
   cronSave: document.querySelector("#cron-save"),
   cronCancelEdit: document.querySelector("#cron-cancel-edit"),
@@ -105,6 +124,7 @@ const elements = {
 };
 
 let configured = false;
+let referenceImagesAllowed = false;
 let chatBusy = false;
 let defaultPrompt = "";
 let defaultOllamaHost = "http://127.0.0.1:11434";
@@ -329,9 +349,51 @@ async function api(path, payload) {
   return result;
 }
 
+function appendGeneratedImage(message) {
+  const ui = message.ui || {};
+  const filename = ui.filename || "";
+  const imageUrl = ui.image_url || "";
+  if (!/^[a-f0-9]{32}\.png$/.test(filename) || imageUrl !== `/api/images/${filename}`) {
+    return false;
+  }
+  const item = document.createElement("article");
+  item.className = "message assistant image-message";
+  const card = document.createElement("section");
+  card.className = "generated-image-card";
+  const preview = document.createElement("button");
+  preview.type = "button";
+  preview.className = "image-preview";
+  preview.setAttribute("aria-label", "Open generated image preview");
+  const image = document.createElement("img");
+  image.src = imageUrl;
+  image.alt = ui.prompt || "Generated image";
+  preview.append(image);
+  const caption = document.createElement("p");
+  caption.className = "image-caption";
+  caption.textContent = ui.prompt || "Generated image";
+  const metadata = document.createElement("small");
+  metadata.className = "image-provider";
+  metadata.textContent = `Generated with ${ui.provider || "image provider"}`;
+  const download = document.createElement("a");
+  download.className = "quiet-button image-download";
+  download.href = imageUrl;
+  download.download = filename;
+  download.textContent = "Download PNG";
+  card.append(preview, caption, metadata, download);
+  item.append(card);
+  elements.messages.append(item);
+  elements.messages.scrollTop = elements.messages.scrollHeight;
+  return true;
+}
+
 function appendMessage(message) {
   const item = document.createElement("article");
   item.className = `message ${message.role}`;
+  if (message.role === "tool" && message.ui?.type === "image") {
+    if (appendGeneratedImage(message)) {
+      return;
+    }
+  }
   if (message.role === "tool" && message.ui) {
     const block = document.createElement("details");
     const summary = document.createElement("summary");
@@ -372,6 +434,16 @@ function appendMessage(message) {
 }
 
 elements.messages.addEventListener("click", async (event) => {
+  const imagePreview = event.target.closest?.("button.image-preview");
+  if (imagePreview) {
+    const image = imagePreview.querySelector("img");
+    if (image) {
+      elements.imageLightboxImage.src = image.src;
+      elements.imageLightboxImage.alt = image.alt;
+      elements.imageLightbox.showModal();
+    }
+    return;
+  }
   const button = event.target.closest?.("button.copy-code");
   if (!button) {
     return;
@@ -385,6 +457,16 @@ elements.messages.addEventListener("click", async (event) => {
     button.textContent = "Copied";
   } catch (error) {
     setStatus(elements.connectionStatus, `Could not copy code: ${error.message}`);
+  }
+});
+
+elements.imageLightboxClose.addEventListener("click", () => {
+  elements.imageLightbox.close();
+});
+
+elements.imageLightbox.addEventListener("click", (event) => {
+  if (event.target === elements.imageLightbox) {
+    elements.imageLightbox.close();
   }
 });
 
@@ -404,11 +486,19 @@ function appendTask(task) {
 
 function renderReplyTasks(tasks, transcript) {
   for (const task of tasks || []) {
-    appendTask(task);
+    if (task.label !== "Generated image") {
+      appendTask(task);
+    }
   }
-  renderedToolCount = (transcript || []).filter(
+  const toolMessages = (transcript || []).filter(
     (message) => message.role === "tool",
-  ).length;
+  );
+  for (const message of toolMessages.slice(renderedToolCount)) {
+    if (message.ui?.type === "image") {
+      appendMessage(message);
+    }
+  }
+  renderedToolCount = toolMessages.length;
 }
 
 function pendingActionText(action) {
@@ -434,8 +524,11 @@ function pendingActionText(action) {
     const enabledState = args.operation === "toggle"
       ? `\nProposed enabled state: ${args.enabled ? "enabled" : "disabled"}`
       : "";
+    const preApproved = args.auto_approve !== false;
     sections.push(
-      `Operation: ${args.operation || "scheduled job"}\nName: ${args.name || "existing job"}\nSchedule: ${args.schedule || "not specified"}\nTarget action / prompt:\n${args.payload || "Not specified"}\n${args.one_time || args.run_once ? "[ONE-TIME] Yes; disable after first execution." : "One-time: No"}${enabledState}\n\nWARNING: If approved, this job may run automatically in the background.`,
+      `Operation: ${args.operation || "scheduled job"}\nName: ${args.name || "existing job"}\nSchedule: ${args.schedule || "not specified"}\nTarget action / prompt:\n${args.payload || "Not specified"}\nAction type: ${args.action_type || "prompt"}\nPre-approved execution: ${
+        preApproved ? "Yes (runs automatically without further prompts)" : "No"
+      }\n${args.one_time || args.run_once ? "[ONE-TIME] Yes; disable after first execution." : "One-time: No"}${enabledState}\n\nWARNING: If approved, this job may run automatically in the background.`,
     );
   }
   return sections.join("\n\n");
@@ -463,12 +556,39 @@ function setBusy(busy) {
   chatBusy = busy;
   elements.sendButton.disabled = busy || !configured || commandPending;
   elements.messageInput.disabled = busy || !configured || commandPending;
+  elements.referenceImage.disabled = busy || !configured || commandPending || !referenceImagesAllowed;
+  elements.referenceImageClear.disabled = busy || !configured || commandPending;
   elements.homeToggle.disabled = busy || commandPending;
   elements.settingsToggle.disabled = busy || commandPending;
   elements.chatsToggle.disabled = busy || commandPending;
   elements.logoutButton.disabled = busy || commandPending;
   setBreakLoopVisible(busy || commandPending);
 }
+
+function updateReferenceImages(imageGen) {
+  referenceImagesAllowed = imageGen?.enabled === true && imageGen.provider === "local_flux";
+  if (!referenceImagesAllowed) {
+    elements.referenceImage.value = "";
+  }
+  elements.referenceImageLabel.title = referenceImagesAllowed
+    ? "Select a reference image for FLUX."
+    : "Enable Image Gen and select local FLUX to upload a reference image.";
+  elements.referenceImageLabel.classList.toggle("reference-disabled", !referenceImagesAllowed);
+  updateReferenceImageSelection();
+  setBusy(chatBusy);
+}
+
+function updateReferenceImageSelection() {
+  const file = elements.referenceImage.files[0];
+  elements.referenceImageName.textContent = file ? file.name : "Add image";
+  elements.referenceImageClear.hidden = !file;
+}
+
+elements.referenceImage.addEventListener("change", updateReferenceImageSelection);
+elements.referenceImageClear.addEventListener("click", () => {
+  elements.referenceImage.value = "";
+  updateReferenceImageSelection();
+});
 
 function selectSettingsTab(name) {
   for (const button of elements.settingsTabs.querySelectorAll("[data-tab]")) {
@@ -501,6 +621,20 @@ function showSettings(config, isSetup, openPanel = true) {
   elements.ollamaHost.value = config.ollama_host || defaultOllamaHost;
   elements.ollamaHost.placeholder = defaultOllamaHost;
   elements.systemPrompt.value = config.prompt;
+  const imageGen = config.image_gen || {};
+  updateReferenceImages(imageGen);
+  elements.imageGenEnabled.checked = imageGen.enabled !== false;
+  elements.imageGenProvider.value = imageGen.provider || "openai";
+  elements.imageGenModel.value = imageGen.model || "gpt-image-1";
+  elements.imageGenApiKey.value = "";
+  elements.imageGenApiKey.disabled = false;
+  elements.imageGenKeyStatus.textContent = imageGen.api_key_configured
+    ? "An API key is configured. Leave blank to keep it."
+    : "No saved API key. You can also use OPENAI_API_KEY or GEMINI_API_KEY.";
+  elements.imageGenClearKey.checked = false;
+  elements.imageGenSize.value = imageGen.size || "1024x1024";
+  elements.imageGenQuality.value = imageGen.quality || "high";
+  setStatus(elements.imageGenStatus, "");
   const profile = config.profile || {};
   elements.profileName.value = profile.name || "";
   elements.profilePreferences.value = profile.preferences || "";
@@ -638,12 +772,16 @@ function renderCronJobs(jobs) {
     name.textContent = job.name;
     const schedule = document.createElement("small");
     schedule.textContent = `${job.completed ? "Completed" : job.enabled ? "Enabled" : "Disabled"} · ${job.schedule}`;
+    const execution = document.createElement("small");
+    execution.textContent = `Action: ${job.action_type || "prompt"} · Pre-approved execution: ${
+      job.auto_approve ? "Yes (runs automatically without further prompts)" : "No"
+    }`;
     const oneTimeBadge = document.createElement("span");
     oneTimeBadge.className = "cron-one-time-badge";
     oneTimeBadge.textContent = "One-time";
     const action = document.createElement("p");
     action.textContent = job.payload;
-    details.append(name, schedule);
+    details.append(name, schedule, execution);
     if (job.one_time || job.run_once) {
       details.append(oneTimeBadge);
     }
@@ -1229,6 +1367,8 @@ elements.cronSave.addEventListener("click", async () => {
     name: elements.cronName.value,
     schedule: elements.cronSchedule.value,
     payload: elements.cronPayload.value,
+    action_type: elements.cronActionType.value,
+    auto_approve: elements.cronAutoApprove.checked,
     one_time: elements.cronOneTime.checked,
   };
   if (editing) {
@@ -1237,7 +1377,10 @@ elements.cronSave.addEventListener("click", async () => {
   const oneTimeNotice = payload.one_time
     ? "\n[ONE-TIME] It will disable itself after its first execution."
     : "\nOne-time: No";
-  const warning = `This job will run automatically in the background when enabled.\n\nSchedule: ${payload.schedule}\nAction: ${payload.payload}${oneTimeNotice}\n\n${editing ? "Apply these changes?" : "Create this job?"}`;
+  const approvalNotice = payload.auto_approve
+    ? "Yes (runs automatically without further prompts)"
+    : "No";
+  const warning = `This job will run automatically in the background when enabled.\n\nSchedule: ${payload.schedule}\nAction type: ${payload.action_type}\nPre-approved execution: ${approvalNotice}\nAction: ${payload.payload}${oneTimeNotice}\n\n${editing ? "Apply these changes?" : "Create this job?"}`;
   if (!window.confirm(warning)) {
     return;
   }
@@ -1248,6 +1391,8 @@ elements.cronSave.addEventListener("click", async () => {
     elements.cronName.value = "";
     elements.cronSchedule.value = "";
     elements.cronPayload.value = "";
+    elements.cronActionType.value = "prompt";
+    elements.cronAutoApprove.checked = true;
     elements.cronOneTime.checked = false;
     elements.cronSave.textContent = "Create scheduled job";
     elements.cronCancelEdit.hidden = true;
@@ -1262,6 +1407,8 @@ elements.cronCancelEdit.addEventListener("click", () => {
   elements.cronName.value = "";
   elements.cronSchedule.value = "";
   elements.cronPayload.value = "";
+  elements.cronActionType.value = "prompt";
+  elements.cronAutoApprove.checked = true;
   elements.cronOneTime.checked = false;
   elements.cronSave.textContent = "Create scheduled job";
   elements.cronCancelEdit.hidden = true;
@@ -1284,6 +1431,8 @@ elements.cronjobsList.addEventListener("click", async (event) => {
       elements.cronName.value = job.name;
       elements.cronSchedule.value = job.schedule;
       elements.cronPayload.value = job.payload;
+      elements.cronActionType.value = job.action_type || "prompt";
+      elements.cronAutoApprove.checked = job.auto_approve !== false;
       elements.cronOneTime.checked = Boolean(job.one_time || job.run_once);
       elements.cronSave.textContent = "Save scheduled job changes";
       elements.cronCancelEdit.hidden = false;
@@ -1294,7 +1443,11 @@ elements.cronjobsList.addEventListener("click", async (event) => {
         : "No execution history.";
     } else if (operation === "toggle") {
       if (!window.confirm(
-        `${job.enabled ? "Disable" : "Enable"} "${job.name}" (${job.schedule})? Enabled jobs run automatically in the background.\n\nAction: ${job.payload}\n${job.one_time || job.run_once ? "[ONE-TIME] Yes; disable after first execution." : "One-time: No"}`,
+        `${job.enabled ? "Disable" : "Enable"} "${job.name}" (${job.schedule})? Enabled jobs run automatically in the background.\n\nAction type: ${job.action_type || "prompt"}\nPre-approved execution: ${
+          job.auto_approve
+            ? "Yes (runs automatically without further prompts)"
+            : "No"
+        }\nAction: ${job.payload}\n${job.one_time || job.run_once ? "[ONE-TIME] Yes; disable after first execution." : "One-time: No"}`,
       )) {
         return;
       }
@@ -1340,6 +1493,53 @@ elements.resetHost.addEventListener("click", () => {
   setStatus(elements.settingsStatus, "Default host restored. Save settings to keep it.");
 });
 
+function imageGenSettingsPayload() {
+  return {
+    enabled: elements.imageGenEnabled.checked,
+    provider: elements.imageGenProvider.value,
+    model: elements.imageGenModel.value.trim(),
+    api_key: elements.imageGenApiKey.value,
+    clear_api_key: elements.imageGenClearKey.checked,
+    size: elements.imageGenSize.value,
+    quality: elements.imageGenQuality.value,
+  };
+}
+
+elements.imageGenProvider.addEventListener("change", () => {
+  const defaultModels = {
+    openai: "gpt-image-1",
+    gemini: "gemini-2.5-flash-image",
+    local_janus: "deepseek-ai/Janus-Pro-1B",
+    local_flux: "mlx-community/FLUX.2-Klein-4B-4bit",
+    local_sana: "Efficient-Large-Model/Sana_Sprint_0.6B_1024px_diffusers",
+  };
+  if (Object.values(defaultModels).includes(elements.imageGenModel.value.trim())) {
+    elements.imageGenModel.value = defaultModels[elements.imageGenProvider.value];
+  }
+});
+
+elements.imageGenClearKey.addEventListener("change", () => {
+  elements.imageGenApiKey.disabled = elements.imageGenClearKey.checked;
+  if (elements.imageGenClearKey.checked) {
+    elements.imageGenApiKey.value = "";
+  }
+});
+
+elements.imageGenCheck.addEventListener("click", async () => {
+  setStatus(elements.imageGenStatus, "Checking provider...");
+  elements.imageGenCheck.disabled = true;
+  try {
+    const result = await api("/api/image-gen/check", {
+      image_gen: imageGenSettingsPayload(),
+    });
+    setStatus(elements.imageGenStatus, result.message);
+  } catch (error) {
+    setStatus(elements.imageGenStatus, error.message);
+  } finally {
+    elements.imageGenCheck.disabled = false;
+  }
+});
+
 elements.settingsClose.addEventListener("click", () => {
   elements.settingsPanel.hidden = true;
   if (activeChatId) {
@@ -1351,6 +1551,10 @@ elements.settingsClose.addEventListener("click", () => {
 
 elements.settingsForm.addEventListener("submit", async (event) => {
   event.preventDefault();
+  const saveButtons = elements.settingsForm.querySelectorAll('button[type="submit"]');
+  for (const button of saveButtons) {
+    button.disabled = true;
+  }
   setStatus(elements.settingsStatus, "Saving...");
   try {
     const mcpServers = JSON.parse(elements.mcpServers.value || "[]");
@@ -1373,12 +1577,14 @@ elements.settingsForm.addEventListener("submit", async (event) => {
       model: elements.modelName.value,
       prompt: elements.systemPrompt.value,
       ollama_host: elements.ollamaHost.value,
+      image_gen: imageGenSettingsPayload(),
       mcp_servers: mcpServers,
       skill_states: skillStates,
     });
     currentSkillStates = skillStates;
     renderSkillControls(config.skills || []);
     configured = true;
+    updateReferenceImages(config.image_gen || {});
     elements.statusLine.textContent = `${config.name} | ${elements.modelName.value.trim()}`;
     elements.settingsToggle.hidden = false;
     elements.chatsToggle.hidden = false;
@@ -1395,6 +1601,10 @@ elements.settingsForm.addEventListener("submit", async (event) => {
     }
   } catch (error) {
     setStatus(elements.settingsStatus, error.message);
+  } finally {
+    for (const button of saveButtons) {
+      button.disabled = false;
+    }
   }
 });
 
@@ -1591,7 +1801,25 @@ elements.chatForm.addEventListener("submit", async (event) => {
   setBusy(true);
   setStatus(elements.connectionStatus, "Thinking...");
   try {
-    const result = await api("/api/chat", { message });
+    const referenceInput = elements.referenceImage;
+    const referenceFile = referenceInput.files[0];
+    let imageFilename;
+    if (referenceFile) {
+      if (referenceFile.size > 8000000) {
+        throw new Error("Reference image must be at most 8 MB.");
+      }
+      const dataUrl = await new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result);
+        reader.onerror = () => reject(new Error("Could not read the reference image."));
+        reader.readAsDataURL(referenceFile);
+      });
+      const uploaded = await api("/api/images/upload", { data: dataUrl.split(",")[1] });
+      imageFilename = uploaded.filename;
+    }
+    const result = await api("/api/chat", { message, image_filename: imageFilename });
+    referenceInput.value = "";
+    updateReferenceImageSelection();
     renderReplyTasks(result.tasks, result.transcript);
     if (result.canceled) {
       if (result.action_task) {

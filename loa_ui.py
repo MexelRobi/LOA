@@ -3,14 +3,15 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 from datetime import datetime, timezone
 from functools import partial
+from pathlib import Path
 
 import httpx
 import ollama
 from ddgs.exceptions import DDGSException
-from rich.markdown import Markdown
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.containers import Container, Horizontal, Vertical
@@ -27,6 +28,7 @@ from textual.widgets import (
     ListView,
     Static,
     TextArea,
+    Select,
     TabbedContent,
     TabPane,
 )
@@ -41,6 +43,7 @@ from loa_agent import (
     ChatMessage,
     action_task,
     action_details,
+    check_image_generation_readiness,
     configure_runtime_tools,
     execute_approved_action,
     format_ollama_error,
@@ -52,6 +55,9 @@ from loa_agent import (
 )
 from loa_config import (
     AssistantConfig,
+    DEFAULT_FLUX_MODEL,
+    DEFAULT_JANUS_MODEL,
+    DEFAULT_SANA_MODEL,
     DEFAULT_OLLAMA_HOST,
     DEFAULT_PROMPT,
     build_system_prompt,
@@ -218,7 +224,9 @@ class SettingsScreen(Screen):
                                             f"{job['name']}"
                                             f"{' | [ONE-TIME]' if job['one_time'] else ''} | "
                                             f"{'Completed' if job['completed'] else job['schedule']} | "
-                                            f"{'enabled' if job['enabled'] else 'disabled'}\n"
+                                            f"{'enabled' if job['enabled'] else 'disabled'} | "
+                                            f"Action: {job['action_type']} | "
+                                            f"Pre-approved: {'Yes' if job['auto_approve'] else 'No'}\n"
                                             f"{job['payload']}",
                                             markup=False,
                                         ))
@@ -229,6 +237,16 @@ class SettingsScreen(Screen):
                                 yield Input(placeholder="Job name", id="cron_name")
                                 yield Input(placeholder="Cron expression or @every 15m", id="cron_schedule")
                                 yield TextArea("", id="cron_payload")
+                                yield Select(
+                                    [("Prompt", "prompt"), ("Shell script (zsh)", "shell")],
+                                    value="prompt",
+                                    id="cron_action_type",
+                                )
+                                yield Checkbox(
+                                    "Pre-approve actions in prompt jobs (run automatically)",
+                                    value=True,
+                                    id="cron_auto_approve",
+                                )
                                 yield Checkbox(
                                     "One-time (disable after first execution)",
                                     id="cron_one_time",
@@ -280,6 +298,76 @@ class SettingsScreen(Screen):
                                     json.dumps(self.config.get("mcp_servers", []), ensure_ascii=False, indent=2),
                                     id="mcp_servers",
                                 )
+                        with TabPane("Image Gen", id="image-gen-settings"):
+                            with VerticalScroll(classes="settings-tab-scroll"):
+                                image_gen = self.config.get("image_gen", {})
+                                if not isinstance(image_gen, dict):
+                                    image_gen = {}
+                                yield Label(
+                                    "Janus is autoregressive; FLUX uses flow matching "
+                                    "and Sana uses diffusion."
+                                )
+                                yield Checkbox(
+                                    "Enable image generation",
+                                    value=image_gen.get("enabled", True) is True,
+                                    id="image_gen_enabled",
+                                )
+                                yield Label("Provider:")
+                                yield Select(
+                                    [
+                                        ("OpenAI (gpt-image-1)", "openai"),
+                                        ("Google Gemini", "gemini"),
+                                        ("Local Janus-Pro", "local_janus"),
+                                        ("Local FLUX.2 Klein (MLX)", "local_flux"),
+                                        ("Local Sana Sprint (PyTorch/MPS)", "local_sana"),
+                                    ],
+                                    value=image_gen.get("provider", "openai"),
+                                    id="image_gen_provider",
+                                )
+                                yield Label("Model:")
+                                yield Input(
+                                    value=str(image_gen.get("model", "gpt-image-1")),
+                                    id="image_gen_model",
+                                )
+                                yield Label(
+                                    "On a 16 GB Mac use deepseek-ai/Janus-Pro-1B. "
+                                    "LOA checks available memory before loading."
+                                )
+                                yield Label("API key (blank keeps saved key):")
+                                yield Input(
+                                    placeholder=(
+                                        "Saved key configured"
+                                        if image_gen.get("api_key")
+                                        else "Optional; may use provider environment variable"
+                                    ),
+                                    password=True,
+                                    id="image_gen_api_key",
+                                )
+                                yield Checkbox(
+                                    "Clear saved API key",
+                                    id="image_gen_clear_key",
+                                )
+                                yield Label("Default size:")
+                                yield Select(
+                                    [
+                                        ("1024 × 1024", "1024x1024"),
+                                        ("1536 × 1024", "1536x1024"),
+                                        ("1024 × 1536", "1024x1536"),
+                                    ],
+                                    value=image_gen.get("size", "1024x1024"),
+                                    id="image_gen_size",
+                                )
+                                yield Label("Default quality:")
+                                yield Select(
+                                    [("Low", "low"), ("Medium", "medium"), ("High", "high")],
+                                    value=image_gen.get("quality", "high"),
+                                    id="image_gen_quality",
+                                )
+                                yield Button(
+                                    "Check connection / readiness",
+                                    id="image_gen_check",
+                                )
+                                yield Label("", id="image_gen_status")
                     yield Label("", id="settings_error")
                     yield Horizontal(
                         Button(
@@ -403,14 +491,24 @@ class SettingsScreen(Screen):
             schedule = self.query_one("#cron_schedule", Input).value.strip()
             payload = self.query_one("#cron_payload", TextArea).text.strip()
             one_time = self.query_one("#cron_one_time", Checkbox).value
+            action_type = str(self.query_one("#cron_action_type", Select).value)
+            auto_approve = self.query_one("#cron_auto_approve", Checkbox).value
+            approval_label = (
+                "Yes (runs automatically without further prompts)"
+                if auto_approve else "No"
+            )
             self.app.push_screen(
                 ConfirmationScreen(
                     f"Create scheduled job '{name}'?\n\nSchedule: {schedule}\n"
                     f"Target action / prompt: {payload}\n"
+                    f"Action type: {action_type}\n"
+                    f"Pre-approved execution: {approval_label}\n"
                     f"One-time: {'[ONE-TIME] Yes; disable after first execution' if one_time else 'No'}\n\n"
                     "WARNING: If approved, it will run automatically in the background."
                 ),
-                lambda approved: self._create_cron_job(name, schedule, payload, one_time)
+                lambda approved: self._create_cron_job(
+                    name, schedule, payload, one_time, action_type, auto_approve
+                )
                 if approved else None,
             )
             return
@@ -454,6 +552,37 @@ class SettingsScreen(Screen):
             )
             return
 
+        if event.button.id == "image_gen_check":
+            current_image_gen = self.config.get("image_gen", {})
+            if not isinstance(current_image_gen, dict):
+                current_image_gen = {}
+            entered_key = self.query_one("#image_gen_api_key", Input).value.strip()
+            image_gen = {
+                "enabled": self.query_one("#image_gen_enabled", Checkbox).value,
+                "provider": self.query_one("#image_gen_provider", Select).value,
+                "model": self.query_one("#image_gen_model", Input).value.strip(),
+                "api_key": (
+                    ""
+                    if self.query_one("#image_gen_clear_key", Checkbox).value
+                    else entered_key or current_image_gen.get("api_key", "")
+                ),
+                "size": self.query_one("#image_gen_size", Select).value,
+                "quality": self.query_one("#image_gen_quality", Select).value,
+            }
+            check_config = {**self.config, "image_gen": image_gen}
+            try:
+                status = check_image_generation_readiness(check_config)
+                self.query_one("#image_gen_status", Label).update(status)
+            except (
+                httpx.HTTPError,
+                OSError,
+                RuntimeError,
+                ValueError,
+                subprocess.SubprocessError,
+            ) as error:
+                self.query_one("#image_gen_status", Label).update(str(error))
+            return
+
         if event.button.id != "save_settings":
             return
 
@@ -481,11 +610,28 @@ class SettingsScreen(Screen):
                     f"#{toggle_id}",
                     Checkbox,
                 ).value
+        current_image_gen = self.config.get("image_gen", {})
+        if not isinstance(current_image_gen, dict):
+            current_image_gen = {}
+        entered_api_key = self.query_one("#image_gen_api_key", Input).value.strip()
+        image_gen: dict[str, object] = {
+            "enabled": self.query_one("#image_gen_enabled", Checkbox).value,
+            "provider": self.query_one("#image_gen_provider", Select).value,
+            "model": self.query_one("#image_gen_model", Input).value.strip(),
+            "api_key": (
+                ""
+                if self.query_one("#image_gen_clear_key", Checkbox).value
+                else entered_api_key or current_image_gen.get("api_key", "")
+            ),
+            "size": self.query_one("#image_gen_size", Select).value,
+            "quality": self.query_one("#image_gen_quality", Select).value,
+        }
         config: AssistantConfig = {
             "name": self.query_one("#ai_name", Input).value.strip(),
             "model": self.query_one("#model_id", Input).value.strip(),
             "prompt": self.query_one("#system_prompt", TextArea).text.strip(),
             "ollama_host": self.query_one("#ollama_host", Input).value.strip(),
+            "image_gen": image_gen,
             "mcp_servers": mcp_servers,
             "skill_states": skill_states,
         }
@@ -510,6 +656,20 @@ class SettingsScreen(Screen):
     def on_input_changed(self, event: Input.Changed) -> None:
         if event.input.id == "brain_search":
             self._refresh_brain_entries(event.value)
+
+    def on_select_changed(self, event: Select.Changed) -> None:
+        if event.select.id != "image_gen_provider" or not isinstance(event.value, str):
+            return
+        default_models = {
+            "openai": "gpt-image-1",
+            "gemini": "gemini-2.5-flash-image",
+            "local_janus": DEFAULT_JANUS_MODEL,
+            "local_flux": DEFAULT_FLUX_MODEL,
+            "local_sana": DEFAULT_SANA_MODEL,
+        }
+        current_model = self.query_one("#image_gen_model", Input).value.strip()
+        if current_model in default_models.values():
+            self.query_one("#image_gen_model", Input).value = default_models[event.value]
 
     def _refresh_brain_entries(self, query: str = "") -> None:
         try:
@@ -538,7 +698,10 @@ class SettingsScreen(Screen):
                 f"{job['name']}"
                 f"{' | [ONE-TIME]' if job['one_time'] else ''} | "
                 f"{'Completed' if job['completed'] else job['schedule']} | "
-                f"{'enabled' if job['enabled'] else 'disabled'}\n{job['payload']}",
+                f"{'enabled' if job['enabled'] else 'disabled'} | "
+                f"Action: {job['action_type']} | "
+                f"Pre-approved: {'Yes' if job['auto_approve'] else 'No'}\n"
+                f"{job['payload']}",
                 markup=False,
             ))
             for job in self.cron_jobs
@@ -550,9 +713,18 @@ class SettingsScreen(Screen):
         schedule: str,
         payload: str,
         one_time: bool,
+        action_type: str,
+        auto_approve: bool,
     ) -> None:
         try:
-            job = create_cron_job(name, schedule, payload, one_time=one_time)
+            job = create_cron_job(
+                name,
+                schedule,
+                payload,
+                one_time=one_time,
+                action_type=action_type,
+                auto_approve=auto_approve,
+            )
             self.cron_jobs.insert(0, job)
             self._refresh_cron_jobs()
             self.query_one("#cron_status", Label).update(
@@ -1145,6 +1317,7 @@ class ChatScreen(Screen):
             httpx.HTTPError,
             DDGSException,
             OSError,
+            RuntimeError,
             ValueError,
         ) as error:
             self.app.call_from_thread(
@@ -1164,7 +1337,10 @@ class ChatScreen(Screen):
         answer = sanitize_tool_content(reply["text"])
         self.messages = reply["history"]
         for task in reply["tasks"]:
-            self._add_collapsible(task["label"], task["details"])
+            if task["label"] == "Generated image":
+                self._write(f"Generated image\n{task['details']}")
+            else:
+                self._add_collapsible(task["label"], task["details"])
         if reply["sources"]:
             assistant = next(
                 (message for message in reversed(self.messages) if message.get("role") == "assistant"),
@@ -1462,10 +1638,27 @@ class ChatScreen(Screen):
             elif role == "tool":
                 ui = message.get("ui")
                 if isinstance(ui, dict):
-                    self._add_collapsible(
-                        str(ui.get("summary", "Completed tool")),
-                        str(ui.get("details", message.get("content", ""))),
-                    )
+                    if ui.get("type") == "image":
+                        self._write_image_summary(ui)
+                    else:
+                        self._add_collapsible(
+                            str(ui.get("summary", "Completed tool")),
+                            str(ui.get("details", message.get("content", ""))),
+                        )
+
+    def _write_image_summary(self, ui: dict[str, object]) -> None:
+        filename = str(ui.get("filename", ""))
+        image_path = (
+            Path.home() / ".loa" / "generated_images" / filename
+            if re.fullmatch(r"[a-f0-9]{32}\.png", filename)
+            else "unavailable"
+        )
+        self._write(
+            "Generated image\n"
+            f"Saved file: {image_path}\n"
+            f"Provider: {ui.get('provider', 'unknown')}\n"
+            f"Prompt: {ui.get('prompt', '')}"
+        )
 
     def _add_collapsible(self, summary: str, details: str) -> None:
         title = summary if summary.startswith("TASK:") else f"TASK: {summary}"
@@ -1507,6 +1700,8 @@ class ChatScreen(Screen):
         self.query_one("#conversation", VerticalScroll).scroll_end(animate=False)
 
     def _write_assistant(self, text: str) -> None:
+        from rich.markdown import Markdown
+
         conversation = self.query_one("#conversation", VerticalScroll)
         conversation.mount(
             Static(f"{self.config['name']}:", markup=False),
