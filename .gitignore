@@ -4,4 +4,5 @@ __pycache__
 dist
 loa.spec
 .DS_Store
-.playwright-mcp/
+.playwright-mcp/release/
+mpkg/usr/local/bin/loa
