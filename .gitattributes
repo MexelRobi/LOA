@@ -1,3 +1,0 @@
-release/1.6/loa filter=lfs diff=lfs merge=lfs -text
-mpkg/usr/local/bin/loa filter=lfs diff=lfs merge=lfs -text
-* !text !filter !merge !diff
