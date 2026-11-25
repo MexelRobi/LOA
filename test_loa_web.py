@@ -95,6 +95,51 @@ class ReferenceImageUploadTests(unittest.TestCase):
             server.server_close()
 
 
+class ImageProgressTests(unittest.TestCase):
+    def test_progress_endpoint_bypasses_the_chat_request_lock(self):
+        state = loa_web.WebChatState(loa_web.default_config())
+        state.set_image_progress(
+            {
+                "active": True,
+                "step": 3,
+                "step_count": 50,
+                "filename": "a" * 32 + ".png",
+                "status": "Denoising",
+            }
+        )
+        server = loa_web.LoaHTTPServer(
+            ("127.0.0.1", 0), loa_web.LoaRequestHandler, state
+        )
+        server_thread = threading.Thread(target=server.serve_forever)
+        server_thread.start()
+        connection = http.client.HTTPConnection(
+            "127.0.0.1", server.server_address[1], timeout=2
+        )
+        try:
+            with (
+                patch.object(loa_web.LoaRequestHandler, "_authorized", return_value=True),
+                state.lock,
+            ):
+                connection.request("GET", "/api/image-progress")
+                response = connection.getresponse()
+                self.assertEqual(response.status, 200)
+                self.assertEqual(
+                    json.loads(response.read()),
+                    {
+                        "active": True,
+                        "step": 3,
+                        "step_count": 50,
+                        "filename": "a" * 32 + ".png",
+                        "status": "Denoising",
+                    },
+                )
+        finally:
+            connection.close()
+            server.shutdown()
+            server_thread.join()
+            server.server_close()
+
+
 class WebServerShutdownTests(unittest.TestCase):
     def test_one_interrupt_exits_during_mcp_initialization(self):
         script = """

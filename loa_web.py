@@ -217,6 +217,8 @@ class WebChatState:
         self._runtime_error: Exception | None = None
         self.lock = threading.RLock()
         self.auth_lock = threading.RLock()
+        self.image_progress_lock = threading.Lock()
+        self.image_progress: dict[str, Any] | None = None
         self.cancellation_lock = threading.Lock()
         self.active_cancellation: AgentCancellation | None = None
         self.sessions: dict[str, float] = {}
@@ -270,6 +272,18 @@ class WebChatState:
             yield
         finally:
             self.lock.release()
+
+    def set_image_progress(self, progress: dict[str, Any]) -> None:
+        with self.image_progress_lock:
+            self.image_progress = dict(progress)
+
+    def get_image_progress(self) -> dict[str, Any]:
+        with self.image_progress_lock:
+            return dict(self.image_progress) if self.image_progress else {"active": False}
+
+    def clear_image_progress(self) -> None:
+        with self.image_progress_lock:
+            self.image_progress = None
 
     def stop_runtime(self) -> None:
         with self._runtime_lifecycle_lock:
@@ -355,6 +369,10 @@ class LoaRequestHandler(BaseHTTPRequestHandler):
 
         if not self._authorized():
             self._send_json({"error": "Unauthorized"}, status=401)
+            return
+
+        if path == "/api/image-progress":
+            self._send_json(self.server.state.get_image_progress())
             return
 
         if path.startswith("/api/images/"):
@@ -1199,6 +1217,7 @@ class LoaRequestHandler(BaseHTTPRequestHandler):
         state.messages.append(user_message)
         state.transcript.append({"role": "user", "content": text})
         _save_active_chat(state)
+        state.clear_image_progress()
         cancellation = self._begin_operation()
         try:
             answer = get_assistant_reply(
@@ -1206,6 +1225,7 @@ class LoaRequestHandler(BaseHTTPRequestHandler):
                 state.messages,
                 active_chat_id=state.session["id"],
                 cancellation=cancellation,
+                progress_callback=state.set_image_progress,
             )
             if not self._finish_operation(cancellation):
                 raise AgentCancelled()
@@ -1243,6 +1263,7 @@ class LoaRequestHandler(BaseHTTPRequestHandler):
             return
         finally:
             self._finish_operation(cancellation)
+            state.clear_image_progress()
 
         state.messages = answer["history"]
         if answer["sources"]:
@@ -1303,6 +1324,7 @@ class LoaRequestHandler(BaseHTTPRequestHandler):
         cancellation = self._begin_operation()
         output: str | None = None
         action_task_entry: dict[str, str] | None = None
+        state.clear_image_progress()
         try:
             try:
                 output = execute_approved_action(action, cancellation)
@@ -1361,6 +1383,7 @@ class LoaRequestHandler(BaseHTTPRequestHandler):
                 state.messages,
                 active_chat_id=state.session["id"],
                 cancellation=cancellation,
+                progress_callback=state.set_image_progress,
             )
             if not self._finish_operation(cancellation):
                 raise AgentCancelled()
@@ -1400,6 +1423,7 @@ class LoaRequestHandler(BaseHTTPRequestHandler):
             return
         finally:
             self._finish_operation(cancellation)
+            state.clear_image_progress()
 
         state.messages = answer["history"]
         if answer["sources"]:

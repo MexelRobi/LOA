@@ -58,6 +58,7 @@ from loa_config import (
     DEFAULT_FLUX_MODEL,
     DEFAULT_JANUS_MODEL,
     DEFAULT_SANA_MODEL,
+    DEFAULT_COREML_SD_MODEL,
     DEFAULT_OLLAMA_HOST,
     DEFAULT_PROMPT,
     build_system_prompt,
@@ -305,7 +306,8 @@ class SettingsScreen(Screen):
                                     image_gen = {}
                                 yield Label(
                                     "Janus is autoregressive; FLUX uses flow matching "
-                                    "and Sana uses diffusion."
+                                    "and Sana uses diffusion. Core ML Stable Diffusion "
+                                    "uses Apple's on-device runtime."
                                 )
                                 yield Checkbox(
                                     "Enable image generation",
@@ -320,6 +322,10 @@ class SettingsScreen(Screen):
                                         ("Local Janus-Pro", "local_janus"),
                                         ("Local FLUX.2 Klein (MLX)", "local_flux"),
                                         ("Local Sana Sprint (PyTorch/MPS)", "local_sana"),
+                                        (
+                                            "Local Stable Diffusion 2.1 (Core ML, low memory)",
+                                            "local_coreml_sd",
+                                        ),
                                     ],
                                     value=image_gen.get("provider", "openai"),
                                     id="image_gen_provider",
@@ -331,7 +337,8 @@ class SettingsScreen(Screen):
                                 )
                                 yield Label(
                                     "On a 16 GB Mac use deepseek-ai/Janus-Pro-1B. "
-                                    "LOA checks available memory before loading."
+                                    "Core ML Stable Diffusion uses a 1.9 GiB process-RSS "
+                                    "limit and downloads about 4.3 GiB if not cached."
                                 )
                                 yield Label("API key (blank keeps saved key):")
                                 yield Input(
@@ -347,15 +354,15 @@ class SettingsScreen(Screen):
                                     "Clear saved API key",
                                     id="image_gen_clear_key",
                                 )
-                                yield Label("Default size:")
-                                yield Select(
-                                    [
-                                        ("1024 × 1024", "1024x1024"),
-                                        ("1536 × 1024", "1536x1024"),
-                                        ("1024 × 1536", "1024x1536"),
-                                    ],
-                                    value=image_gen.get("size", "1024x1024"),
+                                yield Label("Default size (WIDTHxHEIGHT):")
+                                yield Input(
+                                    str(image_gen.get("size", "1024x1024")),
+                                    placeholder="e.g. 1024x1024",
                                     id="image_gen_size",
+                                )
+                                yield Label(
+                                    "Core ML allows custom dimensions up to 4096 per side; "
+                                    "other providers use preset sizes."
                                 )
                                 yield Label("Default quality:")
                                 yield Select(
@@ -566,7 +573,7 @@ class SettingsScreen(Screen):
                     if self.query_one("#image_gen_clear_key", Checkbox).value
                     else entered_key or current_image_gen.get("api_key", "")
                 ),
-                "size": self.query_one("#image_gen_size", Select).value,
+                "size": self.query_one("#image_gen_size", Input).value.strip(),
                 "quality": self.query_one("#image_gen_quality", Select).value,
             }
             check_config = {**self.config, "image_gen": image_gen}
@@ -623,7 +630,7 @@ class SettingsScreen(Screen):
                 if self.query_one("#image_gen_clear_key", Checkbox).value
                 else entered_api_key or current_image_gen.get("api_key", "")
             ),
-            "size": self.query_one("#image_gen_size", Select).value,
+            "size": self.query_one("#image_gen_size", Input).value.strip(),
             "quality": self.query_one("#image_gen_quality", Select).value,
         }
         config: AssistantConfig = {
@@ -666,6 +673,7 @@ class SettingsScreen(Screen):
             "local_janus": DEFAULT_JANUS_MODEL,
             "local_flux": DEFAULT_FLUX_MODEL,
             "local_sana": DEFAULT_SANA_MODEL,
+            "local_coreml_sd": DEFAULT_COREML_SD_MODEL,
         }
         current_model = self.query_one("#image_gen_model", Input).value.strip()
         if current_model in default_models.values():

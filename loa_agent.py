@@ -2,9 +2,12 @@
 
 import json
 import base64
+from copy import deepcopy
+import io
 import os
 import re
 import signal
+import shutil
 import subprocess
 import sys
 import threading
@@ -26,8 +29,11 @@ from loa_config import (
     DEFAULT_FLUX_MODEL,
     DEFAULT_JANUS_MODEL,
     DEFAULT_SANA_MODEL,
+    DEFAULT_COREML_SD_MODEL,
+    DEFAULT_COREML_SD_REVISION,
     DEFAULT_OLLAMA_HOST,
     build_system_prompt,
+    is_valid_image_size,
 )
 from loa_brain import add_brain_entry, search_brain
 from loa_cron import (
@@ -48,6 +54,7 @@ from loa_storage import (
 
 MODEL_KEEP_ALIVE = "5m"
 MAX_TOOL_ITERATIONS = 8
+COREML_SD_STEP_COUNTS = {"low": 20, "medium": 40, "high": 100}
 ChatMessage = dict[str, Any]
 CANCELED_ACTION_RESPONSE = (
     "Request canceled by user. Do not retry this command or tool call; stop and ask "
@@ -1102,11 +1109,33 @@ def configure_runtime_tools(
         if isinstance(image_gen, dict)
         else True
     )
-    base_tools = [
+    base_tools = deepcopy([
         schema
         for schema in BASE_TOOLS
         if image_gen_enabled or schema["function"]["name"] != "generate_image"
-    ]
+    ])
+    if (
+        isinstance(image_gen, dict)
+        and image_gen.get("provider") == "local_coreml_sd"
+    ):
+        for schema in base_tools:
+            function = schema["function"]
+            if function["name"] == "generate_image":
+                function["description"] += (
+                    " For this provider, translate or compose the prompt in English; "
+                    "Stable Diffusion 2.1 follows English prompts much more reliably."
+                )
+                function["parameters"]["properties"]["prompt"]["description"] += (
+                    " For local Core ML Stable Diffusion, write the prompt in English."
+                )
+                size_parameter = function["parameters"]["properties"]["size"]
+                size_parameter.pop("enum", None)
+                size_parameter["description"] = (
+                    "Optional WIDTHxHEIGHT output size in pixels. For this Core ML "
+                    "provider, each dimension may be from 1 to 4096; omit to use "
+                    "the configured default."
+                )
+                break
     base_supported_names = (
         BASE_SUPPORTED_TOOL_NAMES
         if image_gen_enabled
@@ -1458,6 +1487,7 @@ def get_assistant_reply(
     messages: list[ChatMessage],
     active_chat_id: str | None = None,
     cancellation: AgentCancellation | None = None,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> AssistantReply:
     """Answer with bounded native tool calls and return any command for approval."""
     configure_runtime_tools(config)
@@ -1869,15 +1899,21 @@ def get_assistant_reply(
                 configured_image_size = str(
                     config.get("image_gen", {}).get("size", "1024x1024")
                 )
-                supported_image_sizes = {
-                    "1024x1024", "1536x1024", "1024x1536"
-                }
-                if (
-                    not isinstance(image_size, str)
-                    or image_size not in supported_image_sizes
-                ):
+                image_settings = config.get("image_gen", {})
+                provider = (
+                    image_settings.get("provider")
+                    if isinstance(image_settings, dict)
+                    else None
+                )
+                if provider == "local_coreml_sd":
+                    if not is_valid_image_size(image_size, provider):
+                        raise ValueError(
+                            "Core ML image dimensions must be WIDTHxHEIGHT, with "
+                            "each dimension between 1 and 4096 pixels."
+                        )
+                elif not is_valid_image_size(image_size, provider):
                     image_size = configured_image_size
-                if image_size not in supported_image_sizes:
+                if not is_valid_image_size(image_size, provider):
                     raise ValueError(
                         "The configured default image size is not supported."
                     )
@@ -1907,6 +1943,11 @@ def get_assistant_reply(
                     quality,
                     cancellation,
                     **({"image_filename": reference} if reference is not None else {}),
+                    **(
+                        {"progress_callback": progress_callback}
+                        if progress_callback is not None
+                        else {}
+                    ),
                 )
                 details = (
                     f"Provider: {image_ui['provider']}\n"
@@ -2206,7 +2247,7 @@ def _image_generation_api_key(settings: dict[str, Any], provider: str) -> str:
 
 
 def _janus_python_executable() -> str:
-    """Find the Python environment that contains LOA's optional Janus packages."""
+    """Find the Python environment that contains LOA's optional local model packages."""
     candidates: list[Path] = []
     configured_python = os.environ.get("LOA_JANUS_PYTHON", "").strip()
     if configured_python:
@@ -2238,7 +2279,7 @@ def _venv_python_path(virtual_env: Path) -> Path:
     return virtual_env / "bin" / "python"
 
 
-_JANUS_GENERATION_LOCK = threading.Lock()
+_LOCAL_IMAGE_GENERATION_LOCK = threading.Lock()
 _GIB = 1024 ** 3
 
 
@@ -2285,14 +2326,16 @@ def _check_local_image_memory(
         return
     try:
         total = int(subprocess.run(
-            ["sysctl", "-n", "hw.memsize"],
+            ["/usr/sbin/sysctl", "-n", "hw.memsize"],
             capture_output=True,
             text=True,
             check=True,
             timeout=5,
         ).stdout.strip())
     except (OSError, subprocess.SubprocessError, ValueError) as error:
-        raise RuntimeError(f"Could not check total memory for Janus: {error}") from error
+        raise RuntimeError(
+            f"Could not check total memory for local image generation: {error}"
+        ) from error
     if total < minimum_total:
         raise RuntimeError(
             f"{model} needs at least {minimum_total // _GIB} GiB RAM for LOA's "
@@ -2316,13 +2359,197 @@ def _check_janus_running_memory() -> None:
         )
 
 
+def _process_rss_bytes(pid: int) -> int:
+    try:
+        output = subprocess.run(
+            ["ps", "-o", "rss=", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=5,
+        ).stdout.strip()
+        return int(output) * 1024 if output else 0
+    except (OSError, subprocess.SubprocessError, ValueError) as error:
+        raise RuntimeError(f"Could not monitor local image process memory: {error}") from error
+
+
+def _coreml_sd_runner_path(
+    cancellation: AgentCancellation | None = None,
+) -> Path:
+    if getattr(sys, "frozen", False):
+        bundle_directory = Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
+        runner = bundle_directory / "loa-sd-runner"
+        if not runner.is_file() or not os.access(runner, os.X_OK):
+            raise RuntimeError(
+                "The bundled Stable Diffusion runner is missing. Rebuild LOA with "
+                "the macOS Apple Silicon build script."
+            )
+        return runner
+
+    package_directory = Path(__file__).resolve().parent / "loa_sd_runner"
+    runner = package_directory / ".build" / "release" / "loa-sd-runner"
+    if runner.is_file() and os.access(runner, os.X_OK):
+        return runner
+    result = _run_cancellable_process(
+        [
+            "swift",
+            "build",
+            "--package-path",
+            str(package_directory),
+            "--configuration",
+            "release",
+            "--product",
+            "loa-sd-runner",
+        ],
+        cancellation=cancellation,
+        timeout=1800,
+    )
+    if result.returncode:
+        output = (result.stderr or result.stdout).strip()
+        raise RuntimeError(
+            f"Could not build LOA's Core ML Stable Diffusion runner: {output[-2000:]}"
+        )
+    if not runner.is_file() or not os.access(runner, os.X_OK):
+        raise RuntimeError(f"Swift build completed but did not create {runner}.")
+    return runner
+
+
+def _coreml_sd_model_path(cancellation: AgentCancellation | None = None) -> Path:
+    try:
+        from huggingface_hub import snapshot_download
+        from huggingface_hub.constants import HF_HUB_CACHE
+        from huggingface_hub.errors import LocalEntryNotFoundError
+    except ImportError as error:
+        raise RuntimeError(
+            "Hugging Face Hub is missing. Reinstall LOA's requirements before using "
+            "local Core ML Stable Diffusion."
+        ) from error
+
+    model_arguments = {
+        "repo_id": DEFAULT_COREML_SD_MODEL,
+        "revision": DEFAULT_COREML_SD_REVISION,
+        "allow_patterns": ["split_einsum/compiled/**"],
+    }
+    try:
+        snapshot = Path(snapshot_download(**model_arguments, local_files_only=True))
+    except LocalEntryNotFoundError:
+        cache_directory = Path(HF_HUB_CACHE)
+        while not cache_directory.exists() and cache_directory.parent != cache_directory:
+            cache_directory = cache_directory.parent
+        if shutil.disk_usage(cache_directory).free < 5 * _GIB:
+            raise RuntimeError(
+                "The Apple Core ML Stable Diffusion model needs about 4.3 GiB of "
+                "free disk space for its first download."
+            )
+        _check_cancellation(cancellation)
+        snapshot = Path(snapshot_download(**model_arguments))
+
+    model_directory = snapshot / "split_einsum" / "compiled"
+    required_paths = (
+        "TextEncoder.mlmodelc",
+        "UnetChunk1.mlmodelc",
+        "UnetChunk2.mlmodelc",
+        "VAEDecoder.mlmodelc",
+        "vocab.json",
+        "merges.txt",
+    )
+    missing = [name for name in required_paths if not (model_directory / name).exists()]
+    if missing:
+        raise RuntimeError(
+            "The downloaded Core ML Stable Diffusion model is incomplete; missing "
+            + ", ".join(missing)
+            + ". Retry the image generation to resume the download."
+        )
+    return model_directory
+
+
+def _run_coreml_sd_process(
+    model: str,
+    prompt: str,
+    output_path: str,
+    quality: str,
+    cancellation: AgentCancellation | None,
+    progress_callback: Callable[[int, int], None] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    if not _LOCAL_IMAGE_GENERATION_LOCK.acquire(blocking=False):
+        raise RuntimeError("Another local image generation is already running.")
+    try:
+        _check_local_image_memory(model, 8 * _GIB, 2 * _GIB)
+        runner = _coreml_sd_runner_path(cancellation)
+        model_directory = _coreml_sd_model_path(cancellation)
+        steps = COREML_SD_STEP_COUNTS[quality]
+        arguments = [
+            str(runner), str(model_directory), prompt, output_path, str(steps)
+        ]
+        progress_path = None
+        stop_monitor = None
+        monitor_thread = None
+        monitor_errors: list[Exception] = []
+        if progress_callback is not None:
+            progress_path = Path(f"{output_path}.progress")
+            progress_path.unlink(missing_ok=True)
+            arguments.append(str(progress_path))
+            stop_monitor = threading.Event()
+
+            def monitor_progress() -> None:
+                last_status = ""
+                while not stop_monitor.wait(0.02):
+                    try:
+                        status = progress_path.read_text(encoding="ascii")
+                    except FileNotFoundError:
+                        continue
+                    except (OSError, UnicodeError) as error:
+                        monitor_errors.append(error)
+                        return
+                    if status == last_status:
+                        continue
+                    try:
+                        step_value, total_value = status.split("/", 1)
+                        step = int(step_value)
+                        total = int(total_value)
+                        if not 1 <= step <= total:
+                            raise ValueError("Invalid Core ML progress step.")
+                    except ValueError as error:
+                        monitor_errors.append(error)
+                        return
+                    progress_callback(step, total)
+                    last_status = status
+
+            monitor_thread = threading.Thread(
+                target=monitor_progress,
+                name="loa-coreml-progress",
+                daemon=True,
+            )
+            monitor_thread.start()
+        try:
+            result = _run_cancellable_process(
+                arguments,
+                cancellation,
+                timeout=1800,
+                process_memory_limit_bytes=int(1.9 * _GIB),
+            )
+        finally:
+            if stop_monitor is not None:
+                stop_monitor.set()
+            if monitor_thread is not None:
+                monitor_thread.join()
+            if progress_path is not None:
+                progress_path.unlink(missing_ok=True)
+        if monitor_errors:
+            error = monitor_errors[0]
+            raise RuntimeError(f"Could not read Core ML progress: {error}") from error
+        return result
+    finally:
+        _LOCAL_IMAGE_GENERATION_LOCK.release()
+
+
 def _run_janus_process(
     arguments: list[str],
     model: str,
     cancellation: AgentCancellation | None,
 ) -> subprocess.CompletedProcess[str]:
-    if not _JANUS_GENERATION_LOCK.acquire(blocking=False):
-        raise RuntimeError("Another local Janus image generation is already running.")
+    if not _LOCAL_IMAGE_GENERATION_LOCK.acquire(blocking=False):
+        raise RuntimeError("Another local image generation is already running.")
     try:
         _check_janus_memory(model)
         return _run_cancellable_process(
@@ -2332,13 +2559,13 @@ def _run_janus_process(
             memory_guard=_check_janus_running_memory if sys.platform == "darwin" else None,
         )
     finally:
-        _JANUS_GENERATION_LOCK.release()
+        _LOCAL_IMAGE_GENERATION_LOCK.release()
 
 
 def _run_local_image_process(
     arguments: list[str], model: str, cancellation: AgentCancellation | None
 ) -> subprocess.CompletedProcess[str]:
-    if not _JANUS_GENERATION_LOCK.acquire(blocking=False):
+    if not _LOCAL_IMAGE_GENERATION_LOCK.acquire(blocking=False):
         raise RuntimeError("Another local image generation is already running.")
     try:
         _check_local_image_memory(
@@ -2351,7 +2578,7 @@ def _run_local_image_process(
             memory_guard=_check_janus_running_memory if sys.platform == "darwin" else None,
         )
     finally:
-        _JANUS_GENERATION_LOCK.release()
+        _LOCAL_IMAGE_GENERATION_LOCK.release()
 
 
 # Janus config classes use mutable defaults that recent Python rejects as dataclasses.
@@ -2411,6 +2638,34 @@ def _image_generation_http_json(
     return result
 
 
+def _save_provider_image(path: Path, image_bytes: bytes, mime_type: str) -> None:
+    if mime_type == "image/png":
+        if not image_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
+            raise RuntimeError("The image provider returned invalid PNG image data.")
+        with path.open("xb") as image_file:
+            os.chmod(path, 0o600)
+            image_file.write(image_bytes)
+        return
+
+    if mime_type != "image/jpeg":
+        raise RuntimeError("The image provider returned an unsupported image format.")
+    try:
+        from PIL import Image, ImageOps
+    except ImportError as error:
+        raise RuntimeError(
+            "Pillow is required to convert a provider JPEG image to PNG."
+        ) from error
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as image:
+            with path.open("xb") as image_file:
+                os.chmod(path, 0o600)
+                ImageOps.exif_transpose(image).convert("RGB").save(
+                    image_file, format="PNG"
+                )
+    except (OSError, ValueError, Image.DecompressionBombError) as error:
+        raise RuntimeError("The image provider returned invalid JPEG image data.") from error
+
+
 def check_image_generation_readiness(
     config: AssistantConfig,
     cancellation: AgentCancellation | None = None,
@@ -2423,7 +2678,10 @@ def check_image_generation_readiness(
     model = settings.get("model")
     if (
         not isinstance(provider, str)
-        or provider not in {"openai", "gemini", "local_janus", "local_flux", "local_sana"}
+        or provider not in {
+            "openai", "gemini", "local_janus", "local_flux", "local_sana",
+            "local_coreml_sd",
+        }
         or not isinstance(model, str)
         or not model.strip()
     ):
@@ -2487,6 +2745,18 @@ def check_image_generation_readiness(
             raise RuntimeError(f"{provider} is not ready in LOA's venv: {output[-1600:]}")
         return f"Local {provider} dependencies are ready for {model}. Model weights may still need downloading."
 
+    if provider == "local_coreml_sd":
+        if model.strip() != DEFAULT_COREML_SD_MODEL:
+            raise ValueError(f"{provider} supports {DEFAULT_COREML_SD_MODEL}.")
+        if sys.platform != "darwin" or os.uname().machine != "arm64":
+            raise RuntimeError("Local Core ML Stable Diffusion requires an Apple Silicon Mac.")
+        _check_local_image_memory(model.strip(), 8 * _GIB, 2 * _GIB)
+        _coreml_sd_runner_path(cancellation)
+        return (
+            "Local Core ML Stable Diffusion is ready. If its model is not cached, "
+            "the first generation downloads about 4.3 GiB."
+        )
+
     api_key = _image_generation_api_key(settings, provider)
     if not api_key:
         variable = "OPENAI_API_KEY" if provider == "openai" else "GEMINI_API_KEY"
@@ -2515,15 +2785,12 @@ def generate_image(
     quality: str,
     cancellation: AgentCancellation | None = None,
     image_filename: str | None = None,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> tuple[str, dict[str, Any]]:
     """Generate an image through the configured provider and persist it."""
     _check_cancellation(cancellation)
     if not isinstance(prompt, str) or not prompt.strip():
         raise ValueError("The image generation prompt must not be empty.")
-    if not isinstance(size, str) or size not in {
-        "1024x1024", "1536x1024", "1024x1536"
-    }:
-        raise ValueError("The requested image size is not supported.")
     if not isinstance(quality, str) or quality not in {"low", "medium", "high"}:
         raise ValueError("The requested image quality is not supported.")
     settings = config.get("image_gen", {})
@@ -2533,9 +2800,19 @@ def generate_image(
     model = settings.get("model")
     if (
         not isinstance(provider, str)
-        or provider not in {"openai", "gemini", "local_janus", "local_flux", "local_sana"}
+        or provider not in {
+            "openai", "gemini", "local_janus", "local_flux", "local_sana",
+            "local_coreml_sd",
+        }
     ):
         raise ValueError("Choose a valid image generation provider.")
+    if not is_valid_image_size(size, provider):
+        if provider == "local_coreml_sd":
+            raise ValueError(
+                "Core ML image dimensions must be WIDTHxHEIGHT, with each "
+                "dimension between 1 and 4096 pixels."
+            )
+        raise ValueError("The requested image size is not supported.")
     if not isinstance(model, str) or not model.strip():
         raise ValueError("Image generation model must not be empty.")
     reference_path = None
@@ -2554,7 +2831,81 @@ def generate_image(
 
     image_ready = False
     try:
-        if provider in {"local_flux", "local_sana"}:
+        if provider == "local_coreml_sd":
+            if model.strip() != DEFAULT_COREML_SD_MODEL:
+                raise ValueError(f"{provider} supports {DEFAULT_COREML_SD_MODEL}.")
+            if sys.platform != "darwin" or os.uname().machine != "arm64":
+                raise RuntimeError(
+                    "Local Core ML Stable Diffusion requires an Apple Silicon Mac."
+                )
+            step_count = COREML_SD_STEP_COUNTS[quality]
+
+            def report_progress(step: int, total: int, status: str) -> None:
+                if progress_callback is not None:
+                    progress_callback(
+                        {
+                            "active": True,
+                            "step": step,
+                            "step_count": total,
+                            "filename": image_path.name,
+                            "status": status,
+                        }
+                    )
+
+            report_progress(0, step_count, "Preparing Core ML model")
+            coreml_progress_kwargs = (
+                {
+                    "progress_callback": lambda step, total: report_progress(
+                        step, total, "Denoising"
+                    )
+                }
+                if progress_callback is not None
+                else {}
+            )
+            try:
+                result = _run_coreml_sd_process(
+                    model.strip(),
+                    prompt,
+                    str(image_path),
+                    quality,
+                    cancellation,
+                    **coreml_progress_kwargs,
+                )
+            except subprocess.TimeoutExpired as error:
+                raise RuntimeError(
+                    "Local Core ML Stable Diffusion exceeded 30 minutes."
+                ) from error
+            _check_cancellation(cancellation)
+            if result.returncode:
+                output = (result.stderr or result.stdout).strip()
+                raise RuntimeError(
+                    f"Local Core ML Stable Diffusion failed: {output[-2000:]}"
+                )
+            try:
+                from PIL import Image, ImageOps
+            except ImportError as error:
+                raise RuntimeError(
+                    "Pillow is required to resize the 512px Stable Diffusion result."
+                ) from error
+            resized_path = image_path.with_name(
+                f".{image_path.name}.{uuid.uuid4().hex}.tmp.png"
+            )
+            try:
+                width, height = (int(value) for value in size.split("x"))
+                with Image.open(image_path) as source:
+                    resized = ImageOps.fit(
+                        source.convert("RGB"),
+                        (width, height),
+                        method=Image.Resampling.LANCZOS,
+                    )
+                with resized_path.open("xb") as image_file:
+                    os.chmod(resized_path, 0o600)
+                    resized.save(image_file, format="PNG")
+                os.replace(resized_path, image_path)
+            finally:
+                resized_path.unlink(missing_ok=True)
+            report_progress(step_count, step_count, "Finished")
+        elif provider in {"local_flux", "local_sana"}:
             expected_model = DEFAULT_FLUX_MODEL if provider == "local_flux" else DEFAULT_SANA_MODEL
             if model.strip() != expected_model:
                 raise ValueError(f"{provider} supports {expected_model}.")
@@ -2751,6 +3102,7 @@ image.save(output_path, format="PNG")
                 )
         else:
             api_key = _image_generation_api_key(settings, provider)
+            image_mime_type = "image/png"
             if not api_key:
                 variable = "OPENAI_API_KEY" if provider == "openai" else "GEMINI_API_KEY"
                 raise ValueError(
@@ -2833,6 +3185,7 @@ image.save(output_path, format="PNG")
                     "image/png", "image/jpeg"
                 }:
                     raise RuntimeError("Gemini returned no supported inline image data.")
+                image_mime_type = inline_data["mimeType"]
                 encoded_image = inline_data.get("data")
             if not isinstance(encoded_image, str):
                 raise RuntimeError("The image provider returned no base64 image payload.")
@@ -2842,13 +3195,7 @@ image.save(output_path, format="PNG")
                 raise RuntimeError(
                     "The image provider returned invalid base64 image data."
                 ) from error
-            if not image_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
-                raise RuntimeError(
-                    "The image provider returned a non-PNG image; the image was not saved."
-                )
-            with image_path.open("xb") as image_file:
-                os.chmod(image_path, 0o600)
-                image_file.write(image_bytes)
+            _save_provider_image(image_path, image_bytes, image_mime_type)
 
         _check_cancellation(cancellation)
         if not image_path.is_file():
@@ -2937,7 +3284,10 @@ def _run_cancellable_process(
     cancellation: AgentCancellation | None = None,
     timeout: float = 30,
     memory_guard: Callable[[], None] | None = None,
+    process_memory_limit_bytes: int | None = None,
 ) -> subprocess.CompletedProcess[str]:
+    if process_memory_limit_bytes is not None and process_memory_limit_bytes <= 0:
+        raise ValueError("The process memory limit must be positive.")
     _check_cancellation(cancellation)
     process = subprocess.Popen(
         arguments,
@@ -2947,7 +3297,9 @@ def _run_cancellable_process(
         start_new_session=True,
     )
     started_at = time.monotonic()
-    next_memory_check = started_at + 1
+    next_memory_check = started_at + (
+        0.1 if process_memory_limit_bytes is not None else 1
+    )
     while True:
         if cancellation is not None and cancellation.event.is_set():
             try:
@@ -2981,6 +3333,27 @@ def _run_cancellable_process(
                 process.communicate()
                 raise
             next_memory_check = time.monotonic() + 1
+        if (
+            process_memory_limit_bytes is not None
+            and time.monotonic() >= next_memory_check
+        ):
+            try:
+                process_rss = _process_rss_bytes(process.pid)
+                if process_rss > process_memory_limit_bytes:
+                    limit_gib = process_memory_limit_bytes / _GIB
+                    raise RuntimeError(
+                        "Local Core ML Stable Diffusion was stopped because its process "
+                        f"RSS exceeded the {limit_gib:.1f} GiB limit "
+                        f"({process_rss / _GIB:.2f} GiB)."
+                    )
+            except RuntimeError:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.communicate()
+                raise
+            next_memory_check = time.monotonic() + 0.1
         try:
             stdout, stderr = process.communicate(timeout=0.1)
             return subprocess.CompletedProcess(arguments, process.returncode, stdout, stderr)

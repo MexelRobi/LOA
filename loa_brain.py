@@ -8,8 +8,9 @@ import re
 import sqlite3
 import uuid
 from collections import Counter
+from contextlib import contextmanager
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Iterator
 
 
 _TOKEN_PATTERN = re.compile(r"[^\W_][\w'-]{1,}", re.UNICODE)
@@ -71,6 +72,16 @@ def _connect() -> sqlite3.Connection:
         raise RuntimeError(f"Could not open the local Brain database: {error}") from error
 
 
+@contextmanager
+def _managed_connection() -> Iterator[sqlite3.Connection]:
+    connection = _connect()
+    try:
+        with connection:
+            yield connection
+    finally:
+        connection.close()
+
+
 def tokenize(text: str) -> list[str]:
     """Return normalized local tokens; no model or network service is used."""
     return [
@@ -106,7 +117,7 @@ def add_brain_entry(content: str, category: str = "fact") -> dict[str, Any]:
         "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
     try:
-        with _connect() as connection:
+        with _managed_connection() as connection:
             connection.execute(
                 "INSERT INTO brain_entries VALUES (?, ?, ?, ?, ?)",
                 (
@@ -132,7 +143,7 @@ def list_brain_entries(query: str = "", limit: int = 200) -> list[dict[str, Any]
         raise ValueError("Brain search query must be text.")
     query = query.strip()
     try:
-        with _connect() as connection:
+        with _managed_connection() as connection:
             if query:
                 terms = list(dict.fromkeys(tokenize(query)))
                 if not terms:
@@ -167,7 +178,7 @@ def delete_brain_entry(entry_id: str) -> None:
     if not re.fullmatch(r"[a-f0-9]{32}", entry_id):
         raise ValueError("Invalid Brain entry id.")
     try:
-        with _connect() as connection:
+        with _managed_connection() as connection:
             connection.execute("DELETE FROM brain_search WHERE entry_id = ?", (entry_id,))
             connection.execute("DELETE FROM brain_entries WHERE id = ?", (entry_id,))
     except sqlite3.Error as error:

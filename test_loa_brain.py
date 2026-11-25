@@ -1,3 +1,4 @@
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -19,6 +20,13 @@ class BrainSearchTests(unittest.TestCase):
     def tearDown(self):
         self.path_patcher.stop()
         self.temp_dir.cleanup()
+
+    def test_database_connection_closes_after_context_exit(self):
+        with loa_brain._managed_connection() as connection:
+            connection.execute("SELECT 1")
+
+        with self.assertRaisesRegex(sqlite3.ProgrammingError, "closed database"):
+            connection.execute("SELECT 1")
 
     def test_empty_and_whitespace_queries_list_recent_entries(self):
         first = loa_brain.add_brain_entry("First saved fact")

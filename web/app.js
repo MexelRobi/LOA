@@ -133,6 +133,7 @@ let loopStopped = false;
 let activeChatId = null;
 let selectedChatId = null;
 let renderedToolCount = 0;
+let imageProgressCard = null;
 let currentSkillStates = {};
 let currentSkillCommands = [];
 let editingSkillName = null;
@@ -386,6 +387,85 @@ function appendGeneratedImage(message) {
   return true;
 }
 
+function clearImageGenerationProgress() {
+  imageProgressCard?.article.remove();
+  imageProgressCard = null;
+}
+
+function showImageGenerationProgress(progress) {
+  const filename = progress.filename || "";
+  if (!/^[a-f0-9]{32}\.png$/.test(filename)) {
+    return;
+  }
+  if (!imageProgressCard || imageProgressCard.filename !== filename) {
+    clearImageGenerationProgress();
+    const article = document.createElement("article");
+    article.className = "message assistant image-message";
+    const card = document.createElement("section");
+    card.className = "generated-image-card";
+    const preview = document.createElement("button");
+    preview.type = "button";
+    preview.className = "image-preview";
+    preview.setAttribute("aria-label", "Open live Stable Diffusion preview");
+    const image = document.createElement("img");
+    image.alt = "Live Stable Diffusion preview";
+    preview.append(image);
+    const caption = document.createElement("p");
+    caption.className = "image-caption";
+    caption.textContent = "Stable Diffusion live preview";
+    const progressBar = document.createElement("progress");
+    const status = document.createElement("small");
+    status.className = "image-provider";
+    card.append(preview, caption, progressBar, status);
+    article.append(card);
+    elements.messages.append(article);
+    imageProgressCard = {
+      article,
+      filename,
+      image,
+      progressBar,
+      status,
+      lastUpdate: "",
+    };
+  }
+
+  const step = Number.isInteger(progress.step) ? progress.step : 0;
+  const stepCount = Number.isInteger(progress.step_count) && progress.step_count > 0
+    ? progress.step_count
+    : 1;
+  const update = `${step}:${progress.status || ""}`;
+  if (imageProgressCard.lastUpdate === update) {
+    return;
+  }
+  imageProgressCard.lastUpdate = update;
+  imageProgressCard.progressBar.max = stepCount;
+  imageProgressCard.progressBar.value = Math.min(step, stepCount);
+  imageProgressCard.status.textContent = step > 0
+    ? `${progress.status || "Denoising"} — step ${step}/${stepCount}`
+    : progress.status || "Preparing Core ML model";
+  if (step > 0) {
+    imageProgressCard.image.src = `/api/images/${filename}?step=${step}`;
+  }
+  elements.messages.scrollTop = elements.messages.scrollHeight;
+}
+
+async function pollImageGenerationProgress(shouldStop) {
+  while (!shouldStop()) {
+    try {
+      const progress = await api(`/api/image-progress?tick=${Date.now()}`);
+      if (progress.active) {
+        showImageGenerationProgress(progress);
+      }
+    } catch (error) {
+      if (!shouldStop()) {
+        setStatus(elements.connectionStatus, `Image progress unavailable: ${error.message}`);
+      }
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 120));
+  }
+}
+
 function appendMessage(message) {
   const item = document.createElement("article");
   item.className = `message ${message.role}`;
@@ -485,6 +565,7 @@ function appendTask(task) {
 }
 
 function renderReplyTasks(tasks, transcript) {
+  clearImageGenerationProgress();
   for (const task of tasks || []) {
     if (task.label !== "Generated image") {
       appendTask(task);
@@ -1512,6 +1593,7 @@ elements.imageGenProvider.addEventListener("change", () => {
     local_janus: "deepseek-ai/Janus-Pro-1B",
     local_flux: "mlx-community/FLUX.2-Klein-4B-4bit",
     local_sana: "Efficient-Large-Model/Sana_Sprint_0.6B_1024px_diffusers",
+    local_coreml_sd: "apple/coreml-stable-diffusion-2-1-base",
   };
   if (Object.values(defaultModels).includes(elements.imageGenModel.value.trim())) {
     elements.imageGenModel.value = defaultModels[elements.imageGenProvider.value];
@@ -1800,6 +1882,8 @@ elements.chatForm.addEventListener("submit", async (event) => {
 
   setBusy(true);
   setStatus(elements.connectionStatus, "Thinking...");
+  let stopImageProgressPolling = false;
+  let imageProgressPolling;
   try {
     const referenceInput = elements.referenceImage;
     const referenceFile = referenceInput.files[0];
@@ -1817,6 +1901,9 @@ elements.chatForm.addEventListener("submit", async (event) => {
       const uploaded = await api("/api/images/upload", { data: dataUrl.split(",")[1] });
       imageFilename = uploaded.filename;
     }
+    imageProgressPolling = pollImageGenerationProgress(
+      () => stopImageProgressPolling,
+    );
     const result = await api("/api/chat", { message, image_filename: imageFilename });
     referenceInput.value = "";
     updateReferenceImageSelection();
@@ -1850,9 +1937,15 @@ elements.chatForm.addEventListener("submit", async (event) => {
     }
     setStatus(elements.connectionStatus, "");
   } catch (error) {
+    clearImageGenerationProgress();
     appendMessage({ role: "system", content: error.message });
     setStatus(elements.connectionStatus, "");
   } finally {
+    stopImageProgressPolling = true;
+    if (imageProgressPolling) {
+      await imageProgressPolling;
+    }
+    clearImageGenerationProgress();
     setBusy(false);
   }
 });
@@ -1864,7 +1957,12 @@ async function respondToCommand(approved) {
   commandPending = false;
   setBusy(true);
   setStatus(elements.connectionStatus, approved ? "Running command..." : "Cancelling command...");
+  let stopImageProgressPolling = false;
+  let imageProgressPolling;
   try {
+    imageProgressPolling = pollImageGenerationProgress(
+      () => stopImageProgressPolling,
+    );
     const result = await api("/api/command", { approved });
     if (result.action_task) {
       appendTask(result.action_task);
@@ -1897,9 +1995,15 @@ async function respondToCommand(approved) {
         : "",
     );
   } catch (error) {
+    clearImageGenerationProgress();
     appendMessage({ role: "system", content: error.message });
     setStatus(elements.connectionStatus, "");
   } finally {
+    stopImageProgressPolling = true;
+    if (imageProgressPolling) {
+      await imageProgressPolling;
+    }
+    clearImageGenerationProgress();
     elements.chatControls.hidden = commandPending;
     elements.commandControls.hidden = !commandPending;
     setBusy(false);

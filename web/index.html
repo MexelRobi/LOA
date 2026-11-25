@@ -181,7 +181,7 @@
         </section>
         <section class="settings-tab-panel extension-settings" data-settings-panel="image-gen" hidden>
           <h3>Image generation</h3>
-          <p>Janus is autoregressive. FLUX uses flow matching; Sana uses diffusion.</p>
+          <p>Janus is autoregressive. FLUX uses flow matching; Sana and Stable Diffusion use diffusion.</p>
           <label class="image-gen-enabled">
             <input id="image-gen-enabled" type="checkbox">
             Enable image generation
@@ -193,10 +193,11 @@
             <option value="local_janus">Local Janus-Pro</option>
             <option value="local_flux">Local FLUX.2 Klein (MLX)</option>
             <option value="local_sana">Local Sana Sprint (PyTorch/MPS)</option>
+            <option value="local_coreml_sd">Local Stable Diffusion 2.1 (Core ML, low memory)</option>
           </select>
           <label for="image-gen-model">Model</label>
           <input id="image-gen-model" autocomplete="off">
-          <p>For local generation on a 16 GB Mac, use <code>deepseek-ai/Janus-Pro-1B</code>. LOA checks available memory before loading.</p>
+          <p>For local generation on a 16 GB Mac, use <code>deepseek-ai/Janus-Pro-1B</code>. Core ML Stable Diffusion runs on Apple Silicon with a 1.9 GiB process-RSS limit; it downloads about 4.3 GiB if not cached.</p>
           <label for="image-gen-api-key">API key</label>
           <input id="image-gen-api-key" type="password" autocomplete="new-password"
             placeholder="Optional; saved key stays hidden">
@@ -205,12 +206,15 @@
             <input id="image-gen-clear-key" type="checkbox">
             Clear saved API key
           </label>
-          <label for="image-gen-size">Default size</label>
-          <select id="image-gen-size">
-            <option value="1024x1024">1024 × 1024</option>
-            <option value="1536x1024">1536 × 1024</option>
-            <option value="1024x1536">1024 × 1536</option>
-          </select>
+          <label for="image-gen-size">Default size (WIDTHxHEIGHT)</label>
+          <input id="image-gen-size" type="text" list="image-gen-size-presets"
+                 placeholder="e.g. 1024x1024" autocomplete="off">
+          <datalist id="image-gen-size-presets">
+            <option value="1024x1024"></option>
+            <option value="1536x1024"></option>
+            <option value="1024x1536"></option>
+          </datalist>
+          <p>Core ML supports custom dimensions up to 4096 pixels per side. Other providers use the listed preset sizes.</p>
           <label for="image-gen-quality">Default quality</label>
           <select id="image-gen-quality">
             <option value="low">Low</option>

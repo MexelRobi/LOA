@@ -7,6 +7,8 @@ from unittest.mock import patch
 
 from loa_cron import (
     CronScheduler,
+    _connect,
+    _managed_connection,
     create_cron_job,
     get_cron_job_history,
     list_cron_jobs,
@@ -28,6 +30,29 @@ class CronOneTimeTests(unittest.TestCase):
     def tearDown(self):
         self.path_patcher.stop()
         self.temp_dir.cleanup()
+
+    def test_database_open_error_includes_runtime_diagnostics(self):
+        with patch(
+            "loa_cron.sqlite3.connect",
+            side_effect=sqlite3.OperationalError("unable to open database file"),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, "Could not open the local cron database"
+            ) as raised:
+                _connect()
+
+        message = str(raised.exception)
+        self.assertIn(f"path={self.database_path}", message)
+        self.assertIn("parent_details=[uid=", message)
+        self.assertIn("database_details=[unavailable (", message)
+        self.assertIn("euid=", message)
+
+    def test_managed_connection_closes_after_context_exit(self):
+        with _managed_connection() as connection:
+            connection.execute("SELECT 1")
+
+        with self.assertRaisesRegex(sqlite3.ProgrammingError, "closed database"):
+            connection.execute("SELECT 1")
 
     def test_existing_database_migrates_with_recurring_defaults(self):
         with sqlite3.connect(self.database_path) as connection:

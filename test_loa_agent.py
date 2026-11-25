@@ -1,9 +1,11 @@
 import base64
+import io
 import os
 import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -213,6 +215,139 @@ class ImageGenerationTests(unittest.TestCase):
         ):
             _, ui = loa_agent.generate_image(config, "a tree", "1536x1024", "high")
             self.assertEqual(ui["provider"], "local_sana")
+
+    def test_coreml_stable_diffusion_generates_and_resizes_image(self):
+        config = loa_config.default_config()
+        config["image_gen"].update(
+            provider="local_coreml_sd",
+            model=loa_config.DEFAULT_COREML_SD_MODEL,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            output_directory = Path(directory)
+
+            def fake_runner(model, prompt, output_path, quality, cancellation):
+                from PIL import Image
+
+                self.assertEqual(model, loa_config.DEFAULT_COREML_SD_MODEL)
+                self.assertEqual(prompt, "a small red apple")
+                self.assertEqual(quality, "medium")
+                Image.new("RGB", (512, 512), "red").save(output_path, format="PNG")
+                return subprocess.CompletedProcess([], 0, "", "")
+
+            with (
+                patch.object(
+                    loa_agent,
+                    "generated_images_directory_path",
+                    return_value=output_directory,
+                ),
+                patch.object(
+                    loa_agent.os,
+                    "uname",
+                    return_value=type("Uname", (), {"machine": "arm64"})(),
+                ),
+                patch.object(
+                    loa_agent,
+                    "_run_coreml_sd_process",
+                    side_effect=fake_runner,
+                ) as runner,
+            ):
+                _, ui = loa_agent.generate_image(
+                    config,
+                    "a small red apple",
+                    "1537x777",
+                    "medium",
+                )
+            image_path = output_directory / ui["filename"]
+            from PIL import Image
+
+            with Image.open(image_path) as image:
+                self.assertEqual(image.size, (1537, 777))
+                self.assertEqual(image.format, "PNG")
+            self.assertEqual(ui["provider"], "local_coreml_sd")
+            runner.assert_called_once()
+
+    def test_coreml_runner_reports_denoising_steps_and_keeps_rss_limit(self):
+        steps = []
+        with tempfile.TemporaryDirectory() as directory:
+            output_path = Path(directory) / "image.png"
+
+            def fake_process(arguments, cancellation, timeout, process_memory_limit_bytes):
+                self.assertEqual(arguments[-2], "100")
+                self.assertEqual(timeout, 1800)
+                self.assertEqual(process_memory_limit_bytes, int(1.9 * loa_agent._GIB))
+                progress_path = Path(arguments[-1])
+                progress_path.write_text("1/100", encoding="ascii")
+                time.sleep(0.1)
+                progress_path.write_text("2/100", encoding="ascii")
+                time.sleep(0.1)
+                return subprocess.CompletedProcess(arguments, 0, "", "")
+
+            with (
+                patch.object(loa_agent, "_check_local_image_memory"),
+                patch.object(loa_agent, "_coreml_sd_runner_path", return_value=Path("/runner")),
+                patch.object(loa_agent, "_coreml_sd_model_path", return_value=Path("/model")),
+                patch.object(loa_agent, "_run_cancellable_process", side_effect=fake_process),
+            ):
+                loa_agent._run_coreml_sd_process(
+                    loa_config.DEFAULT_COREML_SD_MODEL,
+                    "A purple rabbit",
+                    str(output_path),
+                    "high",
+                    None,
+                    lambda step, total: steps.append((step, total)),
+                )
+
+        self.assertEqual(steps, [(1, 100), (2, 100)])
+        self.assertFalse(Path(f"{output_path}.progress").exists())
+
+    def test_coreml_stable_diffusion_readiness_uses_bundled_runner(self):
+        config = loa_config.default_config()
+        config["image_gen"].update(
+            provider="local_coreml_sd",
+            model=loa_config.DEFAULT_COREML_SD_MODEL,
+        )
+        memory = subprocess.CompletedProcess([], 0, stdout=str(16 * 1024**3))
+        with (
+            patch.object(loa_agent.sys, "platform", "darwin"),
+            patch.object(
+                loa_agent.os,
+                "uname",
+                return_value=type("Uname", (), {"machine": "arm64"})(),
+            ),
+            patch.object(loa_agent.subprocess, "run", return_value=memory),
+            patch.object(loa_agent, "_mac_memory_available", return_value=3 * 1024**3),
+            patch.object(loa_agent, "_coreml_sd_runner_path") as runner,
+        ):
+            message = loa_agent.check_image_generation_readiness(config)
+        self.assertIn("4.3 GiB", message)
+        runner.assert_called_once_with(None)
+
+    def test_local_coreml_sd_defaults_to_apple_model(self):
+        settings = loa_storage._normalize_image_gen_config(
+            {"provider": "local_coreml_sd"}
+        )
+        self.assertEqual(settings["model"], loa_config.DEFAULT_COREML_SD_MODEL)
+        config = loa_config.default_config()
+        config["image_gen"] = settings
+        loa_storage._validate_extension_config(config)
+
+    def test_coreml_custom_dimensions_are_limited_to_4096_per_side(self):
+        config = loa_config.default_config()
+        config["image_gen"].update(
+            provider="local_coreml_sd",
+            size="4096x4096",
+        )
+        loa_storage._validate_extension_config(config)
+
+        for size in ("4097x1024", "1024x4097", "0x512", "512x"):
+            with self.subTest(size=size):
+                config["image_gen"]["size"] = size
+                with self.assertRaisesRegex(ValueError, "size"):
+                    loa_storage._validate_extension_config(config)
+
+        config["image_gen"].update(provider="openai", size="2048x1024")
+        with self.assertRaisesRegex(ValueError, "size"):
+            loa_storage._validate_extension_config(config)
 
     def test_verbose_local_process_does_not_deadlock(self):
         result = loa_agent._run_cancellable_process(
@@ -435,6 +570,18 @@ sys.modules["janus.models"] = models
         ):
             loa_agent._check_janus_memory("deepseek-ai/Janus-Pro-1B")
 
+    def test_total_memory_check_uses_absolute_sysctl_path(self):
+        memory = subprocess.CompletedProcess([], 0, stdout=str(16 * 1024 ** 3))
+        with (
+            patch.object(loa_agent.sys, "platform", "darwin"),
+            patch.object(loa_agent.subprocess, "run", return_value=memory) as run,
+            patch.object(loa_agent, "_mac_memory_available", return_value=9 * 1024 ** 3),
+        ):
+            loa_agent._check_local_image_memory(
+                "test-model", 8 * 1024 ** 3, 2 * 1024 ** 3
+            )
+        self.assertEqual(run.call_args.args[0][0], "/usr/sbin/sysctl")
+
     def test_sana_memory_limit_applies_to_readiness_and_generation(self):
         config = loa_config.default_config()
         config["image_gen"].update(provider="local_sana", model=loa_config.DEFAULT_SANA_MODEL)
@@ -483,13 +630,23 @@ sys.modules["janus.models"] = models
                 memory_guard=guard,
             )
 
+    def test_process_memory_limit_stops_process_over_limit(self):
+        with (
+            patch.object(loa_agent, "_process_rss_bytes", return_value=2),
+            self.assertRaisesRegex(RuntimeError, "exceeded the 0.0 GiB limit"),
+        ):
+            loa_agent._run_cancellable_process(
+                [sys.executable, "-c", "import time; time.sleep(20)"],
+                process_memory_limit_bytes=1,
+            )
+
     def test_janus_rejects_concurrent_generation(self):
-        loa_agent._JANUS_GENERATION_LOCK.acquire()
+        loa_agent._LOCAL_IMAGE_GENERATION_LOCK.acquire()
         try:
             with self.assertRaisesRegex(RuntimeError, "already running"):
                 loa_agent._run_janus_process([], "deepseek-ai/Janus-Pro-1B", None)
         finally:
-            loa_agent._JANUS_GENERATION_LOCK.release()
+            loa_agent._LOCAL_IMAGE_GENERATION_LOCK.release()
 
     def test_janus_runner_honors_explicit_venv_interpreter(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -545,6 +702,51 @@ sys.modules["janus.models"] = models
                 self.assertIn(
                     "generate_image",
                     {item["function"]["name"] for item in loa_agent.TOOLS},
+                )
+                size_parameter = next(
+                    item["function"]["parameters"]["properties"]["size"]
+                    for item in loa_agent.TOOLS
+                    if item["function"]["name"] == "generate_image"
+                )
+                self.assertEqual(
+                    size_parameter["enum"],
+                    ["1024x1024", "1536x1024", "1024x1536"],
+                )
+        finally:
+            loa_agent.TOOLS = original_tools
+            loa_agent.SUPPORTED_TOOL_NAMES = original_supported
+
+    def test_coreml_image_tool_requests_english_prompt(self):
+        original_tools = loa_agent.TOOLS
+        original_supported = loa_agent.SUPPORTED_TOOL_NAMES
+        config = loa_config.default_config()
+        config["image_gen"]["provider"] = "local_coreml_sd"
+        try:
+            with (
+                patch.object(loa_agent.mcp_manager, "ensure_configured"),
+                patch.object(loa_agent.mcp_manager, "tool_schemas", return_value=[]),
+                patch("loa_agent.load_python_skill_tools", return_value=([], {})),
+            ):
+                loa_agent.configure_runtime_tools(config)
+                tool = next(
+                    item for item in loa_agent.TOOLS
+                    if item["function"]["name"] == "generate_image"
+                )
+                self.assertIn("in English", tool["function"]["description"])
+                self.assertIn(
+                    "write the prompt in English",
+                    tool["function"]["parameters"]["properties"]["prompt"]["description"],
+                )
+                size_parameter = tool["function"]["parameters"]["properties"]["size"]
+                self.assertNotIn("enum", size_parameter)
+                self.assertIn("4096", size_parameter["description"])
+                self.assertNotIn(
+                    "in English",
+                    next(
+                        item["function"]["description"]
+                        for item in loa_agent.BASE_TOOLS
+                        if item["function"]["name"] == "generate_image"
+                    ),
                 )
         finally:
             loa_agent.TOOLS = original_tools
@@ -624,6 +826,73 @@ sys.modules["janus.models"] = models
                 },
             )
 
+    def test_gemini_jpeg_response_is_normalized_to_private_png(self):
+        from PIL import Image
+
+        jpeg = io.BytesIO()
+        Image.new("RGB", (24, 12), (200, 80, 20)).save(jpeg, format="JPEG")
+        config = loa_config.default_config()
+        config["image_gen"].update(
+            provider="gemini",
+            model="gemini-2.5-flash-image",
+            api_key="test-key",
+        )
+        response = {
+            "candidates": [{
+                "content": {
+                    "parts": [{
+                        "inlineData": {
+                            "mimeType": "image/jpeg",
+                            "data": base64.b64encode(jpeg.getvalue()).decode("ascii"),
+                        }
+                    }]
+                }
+            }]
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            with (
+                patch.object(
+                    loa_agent,
+                    "generated_images_directory_path",
+                    return_value=Path(directory),
+                ),
+                patch.object(
+                    loa_agent,
+                    "_image_generation_http_json",
+                    return_value=response,
+                ) as request,
+            ):
+                loa_agent.generate_image(
+                    config,
+                    "A quiet mountain lake at dawn",
+                    "1536x1024",
+                    "medium",
+                )
+
+            image_path = next(Path(directory).glob("*.png"))
+            self.assertEqual(stat.S_IMODE(image_path.stat().st_mode), 0o600)
+            with Image.open(image_path) as image:
+                self.assertEqual(image.format, "PNG")
+                self.assertEqual(image.size, (24, 12))
+
+        self.assertEqual(
+            request.call_args.args[:5],
+            (
+                "POST",
+                "https://generativelanguage.googleapis.com/v1beta/"
+                "models/gemini-2.5-flash-image:generateContent",
+                "gemini",
+                "test-key",
+                None,
+            ),
+        )
+        payload = request.call_args.args[5]
+        self.assertEqual(
+            payload["generationConfig"]["imageConfig"]["aspectRatio"],
+            "3:2",
+        )
+
     def test_tool_result_keeps_image_metadata_in_chat_history(self):
         image_ui = {
             "type": "image",
@@ -678,6 +947,54 @@ sys.modules["janus.models"] = models
         )
         self.assertEqual(image_result["ui"], image_ui)
         self.assertEqual(image_result["role"], "tool")
+
+    def test_image_tool_uses_custom_coreml_default_size(self):
+        config = loa_config.default_config()
+        config["image_gen"].update(
+            provider="local_coreml_sd",
+            size="2048x1024",
+        )
+        tool_response = {
+            "tool_calls": [
+                {
+                    "function": {
+                        "name": "generate_image",
+                        "arguments": {"prompt": "A test image"},
+                    }
+                }
+            ]
+        }
+        with (
+            patch("loa_agent.configure_runtime_tools"),
+            patch("loa_agent.ollama.Client", return_value=Mock()),
+            patch(
+                "loa_agent._request_assistant_message",
+                side_effect=[(tool_response, True), ({"content": "Done."}, True)],
+            ),
+            patch(
+                "loa_agent.generate_image",
+                return_value=(
+                    "Generated image saved.",
+                    {
+                        "type": "image",
+                        "provider": "local_coreml_sd",
+                        "filename": "b" * 32 + ".png",
+                    },
+                ),
+            ) as generate,
+        ):
+            loa_agent.get_assistant_reply(
+                config,
+                [{"role": "user", "content": "Make an image."}],
+            )
+
+        generate.assert_called_once_with(
+            config,
+            "A test image",
+            "2048x1024",
+            "high",
+            None,
+        )
 
     def test_image_generation_configuration_is_validated(self):
         config = loa_config.default_config()

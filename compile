@@ -12,14 +12,28 @@ if [ ! -x "$VENV_PYTHON" ]; then
 fi
 
 "$VENV_PYTHON" -m pip install -r requirements.txt
-"$VENV_PYTHON" -m PyInstaller \
+(
+    if [ "$(uname -s)" = "Darwin" ] && [ "$(uname -m)" = "arm64" ]; then
+        cd loa_sd_runner
+        swift build --configuration release --product loa-sd-runner
+    fi
+)
+
+set -- \
     --clean \
+    --noconfirm \
     --onefile \
     --name loa \
     --collect-all textual \
     --collect-all ollama \
     --collect-all ddgs \
-    --add-data "web:web" \
-    loa.py
+    --collect-all huggingface_hub \
+    --add-data "web:web"
+if [ "$(uname -s)" = "Darwin" ] && [ "$(uname -m)" = "arm64" ]; then
+    set -- "$@" --add-binary "loa_sd_runner/.build/release/loa-sd-runner:."
+fi
+"$VENV_PYTHON" -m PyInstaller "$@" loa.py
+cp loa_sd_runner/APPLE_ML_STABLE_DIFFUSION_LICENSE.md \
+    dist/APPLE_ML_STABLE_DIFFUSION_LICENSE.md
 
 printf '\nBuild complete: %s/dist/loa\n' "$(pwd)"

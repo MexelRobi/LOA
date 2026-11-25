@@ -4,14 +4,18 @@ from __future__ import annotations
 
 import sqlite3
 import logging
+import os
 import re
+import stat
 import subprocess
+import sys
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 import httpx
 import ollama
@@ -26,6 +30,17 @@ def cron_database_path() -> Path:
     from loa_storage import config_file_path
 
     return config_file_path().parent / "cronjobs.sqlite3"
+
+
+def _filesystem_details(path: Path) -> str:
+    try:
+        details = path.stat()
+    except OSError as error:
+        return f"unavailable ({error})"
+    return (
+        f"uid={details.st_uid} gid={details.st_gid} "
+        f"mode={stat.S_IMODE(details.st_mode):04o}"
+    )
 
 
 def _connect() -> sqlite3.Connection:
@@ -84,7 +99,25 @@ def _connect() -> sqlite3.Connection:
         path.chmod(0o600)
         return connection
     except sqlite3.Error as error:
-        raise RuntimeError(f"Could not open the local cron database: {error}") from error
+        details = (
+            f"path={path} parent_details=[{_filesystem_details(path.parent)}] "
+            f"database_details=[{_filesystem_details(path)}] "
+            f"pid={os.getpid()} uid={os.getuid()} euid={os.geteuid()} "
+            f"HOME={os.environ.get('HOME')!r} executable={sys.executable}"
+        )
+        raise RuntimeError(
+            f"Could not open the local cron database ({details}): {error}"
+        ) from error
+
+
+@contextmanager
+def _managed_connection() -> Iterator[sqlite3.Connection]:
+    connection = _connect()
+    try:
+        with connection:
+            yield connection
+    finally:
+        connection.close()
 
 
 def validate_schedule(schedule: str) -> str:
@@ -196,7 +229,7 @@ def _job(row: sqlite3.Row) -> dict[str, Any]:
 
 def list_cron_jobs() -> list[dict[str, Any]]:
     try:
-        with _connect() as connection:
+        with _managed_connection() as connection:
             rows = connection.execute(
                 "SELECT * FROM cron_jobs ORDER BY enabled DESC, next_run ASC, name COLLATE NOCASE"
             ).fetchall()
@@ -248,7 +281,7 @@ def create_cron_job(
     now = time.time()
     job_id = uuid.uuid4().hex
     try:
-        with _connect() as connection:
+        with _managed_connection() as connection:
             connection.execute(
                 """INSERT INTO cron_jobs
                 (id, name, schedule, payload, enabled, created_at, next_run, one_time,
@@ -307,7 +340,7 @@ def update_cron_job(
     now = time.time()
     next_run = _next_run(new_schedule, now) if job["enabled"] else job["next_run"]
     try:
-        with _connect() as connection:
+        with _managed_connection() as connection:
             connection.execute(
                 """UPDATE cron_jobs
                 SET name=?, schedule=?, payload=?, next_run=?, one_time=?, completed=?,
@@ -339,7 +372,7 @@ def toggle_cron_job(job_id: str, enabled: bool) -> dict[str, Any]:
         raise ValueError("A completed one-time cronjob cannot be enabled again.")
     next_run = _next_run(job["schedule"]) if enabled else job["next_run"]
     try:
-        with _connect() as connection:
+        with _managed_connection() as connection:
             connection.execute(
                 "UPDATE cron_jobs SET enabled=?, next_run=? WHERE id=?",
                 (int(enabled), next_run, job_id),
@@ -353,7 +386,7 @@ def toggle_cron_job(job_id: str, enabled: bool) -> dict[str, Any]:
 def delete_cron_job(job_id: str) -> None:
     _get_job_row(job_id)
     try:
-        with _connect() as connection:
+        with _managed_connection() as connection:
             connection.execute("DELETE FROM cron_jobs WHERE id=?", (job_id,))
             connection.execute("DELETE FROM cron_history WHERE job_id=?", (job_id,))
     except sqlite3.Error as error:
@@ -363,7 +396,7 @@ def delete_cron_job(job_id: str) -> None:
 def get_cron_job_history(job_id: str, limit: int = 20) -> list[dict[str, Any]]:
     _get_job_row(job_id)
     try:
-        with _connect() as connection:
+        with _managed_connection() as connection:
             rows = connection.execute(
                 """SELECT * FROM cron_history WHERE job_id=?
                 ORDER BY started_at DESC LIMIT ?""",
@@ -387,7 +420,7 @@ def _get_job_row(job_id: str) -> sqlite3.Row:
     if not isinstance(job_id, str) or not re.fullmatch(r"[a-f0-9]{32}", job_id):
         raise ValueError("Invalid cronjob id.")
     try:
-        with _connect() as connection:
+        with _managed_connection() as connection:
             row = connection.execute("SELECT * FROM cron_jobs WHERE id=?", (job_id,)).fetchone()
     except sqlite3.Error as error:
         raise RuntimeError(f"Could not load cronjob {job_id}: {error}") from error
@@ -411,6 +444,16 @@ class CronScheduler:
             self._executor = executor
             if self._thread and self._thread.is_alive():
                 return
+            logging.getLogger(__name__).warning(
+                "Starting cron scheduler: database=%s pid=%s uid=%s euid=%s "
+                "HOME=%r executable=%s",
+                cron_database_path(),
+                os.getpid(),
+                os.getuid(),
+                os.geteuid(),
+                os.environ.get("HOME"),
+                sys.executable,
+            )
             self._stop.clear()
             self._thread = threading.Thread(target=self._run, name="loa-cron", daemon=True)
             self._thread.start()
@@ -444,7 +487,7 @@ class CronScheduler:
         while not self._stop.wait(1):
             now = time.time()
             try:
-                with _connect() as connection:
+                with _managed_connection() as connection:
                     due = connection.execute(
                         "SELECT * FROM cron_jobs WHERE enabled=1 AND next_run<=?",
                         (now,),
@@ -486,7 +529,7 @@ class CronScheduler:
         history_id: int | None = None
         unexpected_error: Exception | None = None
         try:
-            with _connect() as connection:
+            with _managed_connection() as connection:
                 cursor = connection.execute(
                     "INSERT INTO cron_history(job_id, started_at, status) VALUES (?, ?, 'running')",
                     (job["id"], started),
@@ -522,7 +565,7 @@ class CronScheduler:
         if history_id is None:
             raise RuntimeError(output)
         try:
-            with _connect() as connection:
+            with _managed_connection() as connection:
                 connection.execute(
                     "UPDATE cron_history SET finished_at=?, status=?, output=? WHERE id=?",
                     (time.time(), status, str(output)[:10000], history_id),

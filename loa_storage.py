@@ -17,10 +17,12 @@ from loa_config import (
     DEFAULT_FLUX_MODEL,
     DEFAULT_JANUS_MODEL,
     DEFAULT_SANA_MODEL,
+    DEFAULT_COREML_SD_MODEL,
     DEFAULT_MCP_SERVERS,
     DEFAULT_PROMPT,
     default_ollama_host,
     ensure_security_directive,
+    is_valid_image_size,
 )
 
 
@@ -556,16 +558,15 @@ def _validate_extension_config(config: AssistantConfig) -> None:
         raise ValueError("Image generation enabled must be a boolean.")
     provider = image_gen.get("provider")
     if not isinstance(provider, str) or provider not in {
-        "openai", "gemini", "local_janus", "local_flux", "local_sana"
+        "openai", "gemini", "local_janus", "local_flux", "local_sana",
+        "local_coreml_sd",
     }:
         raise ValueError("Invalid image generation provider.")
     if not isinstance(image_gen.get("model"), str) or not image_gen["model"].strip():
         raise ValueError("Image generation model must not be empty.")
     if not isinstance(image_gen.get("api_key"), str):
         raise ValueError("Image generation API key must be text.")
-    if not isinstance(image_gen.get("size"), str) or image_gen["size"] not in {
-        "1024x1024", "1536x1024", "1024x1536"
-    }:
+    if not is_valid_image_size(image_gen.get("size"), provider):
         raise ValueError("Image generation size is not supported.")
     if not isinstance(image_gen.get("quality"), str) or image_gen["quality"] not in {
         "low", "medium", "high"
@@ -621,6 +622,7 @@ def _normalize_image_gen_config(value: object) -> dict[str, object]:
         "local_janus": DEFAULT_JANUS_MODEL,
         "local_flux": DEFAULT_FLUX_MODEL,
         "local_sana": DEFAULT_SANA_MODEL,
+        "local_coreml_sd": DEFAULT_COREML_SD_MODEL,
     }
     if not isinstance(provider, str) or provider not in model_defaults:
         raise ValueError("Invalid image generation provider.")
