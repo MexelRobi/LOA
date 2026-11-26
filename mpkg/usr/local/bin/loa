@@ -1,0 +1,3 @@
+#!/bin/sh
+echo "LOA binary was not downloaded yet. Please reinstall via mpkg."
+exit 1
