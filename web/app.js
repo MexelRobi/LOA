@@ -24,10 +24,10 @@ const elements = {
   messages: document.querySelector("#messages"),
   chatForm: document.querySelector("#chat-form"),
   messageInput: document.querySelector("#message-input"),
-  referenceImage: document.querySelector("#reference-image"),
-  referenceImageLabel: document.querySelector("#reference-image-label"),
-  referenceImageName: document.querySelector("#reference-image-name"),
-  referenceImageClear: document.querySelector("#reference-image-clear"),
+  chatFiles: document.querySelector("#chat-files"),
+  addFileButton: document.querySelector("#add-file-button"),
+  chatFileNames: document.querySelector("#chat-file-names"),
+  clearChatFiles: document.querySelector("#clear-chat-files"),
   skillCommandHints: document.querySelector("#skill-command-hints"),
   sendButton: document.querySelector("#send-button"),
   breakLoopButton: document.querySelector("#break-loop-button"),
@@ -124,7 +124,6 @@ const elements = {
 };
 
 let configured = false;
-let referenceImagesAllowed = false;
 let chatBusy = false;
 let defaultPrompt = "";
 let defaultOllamaHost = "http://127.0.0.1:11434";
@@ -637,8 +636,9 @@ function setBusy(busy) {
   chatBusy = busy;
   elements.sendButton.disabled = busy || !configured || commandPending;
   elements.messageInput.disabled = busy || !configured || commandPending;
-  elements.referenceImage.disabled = busy || !configured || commandPending || !referenceImagesAllowed;
-  elements.referenceImageClear.disabled = busy || !configured || commandPending;
+  elements.chatFiles.disabled = busy || !configured || commandPending;
+  elements.addFileButton.disabled = busy || !configured || commandPending;
+  elements.clearChatFiles.disabled = busy || !configured || commandPending;
   elements.homeToggle.disabled = busy || commandPending;
   elements.settingsToggle.disabled = busy || commandPending;
   elements.chatsToggle.disabled = busy || commandPending;
@@ -646,29 +646,17 @@ function setBusy(busy) {
   setBreakLoopVisible(busy || commandPending);
 }
 
-function updateReferenceImages(imageGen) {
-  referenceImagesAllowed = imageGen?.enabled === true && imageGen.provider === "local_flux";
-  if (!referenceImagesAllowed) {
-    elements.referenceImage.value = "";
-  }
-  elements.referenceImageLabel.title = referenceImagesAllowed
-    ? "Select a reference image for FLUX."
-    : "Enable Image Gen and select local FLUX to upload a reference image.";
-  elements.referenceImageLabel.classList.toggle("reference-disabled", !referenceImagesAllowed);
-  updateReferenceImageSelection();
-  setBusy(chatBusy);
+function updateChatFileSelection() {
+  const files = [...elements.chatFiles.files];
+  elements.chatFileNames.textContent = files.map((file) => file.name).join(", ");
+  elements.clearChatFiles.hidden = files.length === 0;
 }
 
-function updateReferenceImageSelection() {
-  const file = elements.referenceImage.files[0];
-  elements.referenceImageName.textContent = file ? file.name : "Add image";
-  elements.referenceImageClear.hidden = !file;
-}
-
-elements.referenceImage.addEventListener("change", updateReferenceImageSelection);
-elements.referenceImageClear.addEventListener("click", () => {
-  elements.referenceImage.value = "";
-  updateReferenceImageSelection();
+elements.addFileButton.addEventListener("click", () => elements.chatFiles.click());
+elements.chatFiles.addEventListener("change", updateChatFileSelection);
+elements.clearChatFiles.addEventListener("click", () => {
+  elements.chatFiles.value = "";
+  updateChatFileSelection();
 });
 
 function selectSettingsTab(name) {
@@ -703,7 +691,6 @@ function showSettings(config, isSetup, openPanel = true) {
   elements.ollamaHost.placeholder = defaultOllamaHost;
   elements.systemPrompt.value = config.prompt;
   const imageGen = config.image_gen || {};
-  updateReferenceImages(imageGen);
   elements.imageGenEnabled.checked = imageGen.enabled !== false;
   elements.imageGenProvider.value = imageGen.provider || "openai";
   elements.imageGenModel.value = imageGen.model || "gpt-image-1";
@@ -1590,9 +1577,6 @@ elements.imageGenProvider.addEventListener("change", () => {
   const defaultModels = {
     openai: "gpt-image-1",
     gemini: "gemini-2.5-flash-image",
-    local_janus: "deepseek-ai/Janus-Pro-1B",
-    local_flux: "mlx-community/FLUX.2-Klein-4B-4bit",
-    local_sana: "Efficient-Large-Model/Sana_Sprint_0.6B_1024px_diffusers",
     local_coreml_sd: "apple/coreml-stable-diffusion-2-1-base",
   };
   if (Object.values(defaultModels).includes(elements.imageGenModel.value.trim())) {
@@ -1666,7 +1650,6 @@ elements.settingsForm.addEventListener("submit", async (event) => {
     currentSkillStates = skillStates;
     renderSkillControls(config.skills || []);
     configured = true;
-    updateReferenceImages(config.image_gen || {});
     elements.statusLine.textContent = `${config.name} | ${elements.modelName.value.trim()}`;
     elements.settingsToggle.hidden = false;
     elements.chatsToggle.hidden = false;
@@ -1885,28 +1868,37 @@ elements.chatForm.addEventListener("submit", async (event) => {
   let stopImageProgressPolling = false;
   let imageProgressPolling;
   try {
-    const referenceInput = elements.referenceImage;
-    const referenceFile = referenceInput.files[0];
-    let imageFilename;
-    if (referenceFile) {
-      if (referenceFile.size > 8000000) {
-        throw new Error("Reference image must be at most 8 MB.");
+    const attachments = [];
+    if (elements.chatFiles.files.length > 12) {
+      throw new Error("Attach no more than 12 files per message.");
+    }
+    for (const file of elements.chatFiles.files) {
+      if (file.size > 8000000) {
+        throw new Error(`${file.name} must be at most 8 MB.`);
       }
       const dataUrl = await new Promise((resolve, reject) => {
         const reader = new FileReader();
         reader.onload = () => resolve(reader.result);
-        reader.onerror = () => reject(new Error("Could not read the reference image."));
-        reader.readAsDataURL(referenceFile);
+        reader.onerror = () => reject(new Error(`Could not read ${file.name}.`));
+        reader.readAsDataURL(file);
       });
-      const uploaded = await api("/api/images/upload", { data: dataUrl.split(",")[1] });
-      imageFilename = uploaded.filename;
+      const uploaded = await api("/api/files/upload", {
+        filename: file.name,
+        content_type: file.type,
+        data: dataUrl.split(",")[1],
+      });
+      attachments.push({
+        id: uploaded.id,
+        filename: uploaded.filename,
+        mime_type: uploaded.mime_type,
+      });
     }
     imageProgressPolling = pollImageGenerationProgress(
       () => stopImageProgressPolling,
     );
-    const result = await api("/api/chat", { message, image_filename: imageFilename });
-    referenceInput.value = "";
-    updateReferenceImageSelection();
+    const result = await api("/api/chat", { message, attachments });
+    elements.chatFiles.value = "";
+    updateChatFileSelection();
     renderReplyTasks(result.tasks, result.transcript);
     if (result.canceled) {
       if (result.action_task) {

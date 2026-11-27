@@ -518,7 +518,7 @@ textarea {
   color: #d4d8dc;
 }
 
-.reference-button {
+.file-button {
   display: inline-flex;
   align-items: center;
   gap: 7px;
@@ -534,32 +534,33 @@ textarea {
   transition: background 140ms, border-color 140ms;
 }
 
-.reference-button:not(.reference-disabled):hover {
+.file-button:hover:not(:disabled) {
   border-color: #8c99a9;
   background: #303740;
 }
 
-.reference-button span {
+.file-button svg {
+  flex: none;
+}
+
+#chat-files:focus-visible + .file-button {
+  outline: 2px solid #aebdd0;
+  outline-offset: 2px;
+}
+
+.file-button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.chat-file-names {
+  max-width: 260px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.reference-button svg {
-  flex: none;
-}
-
-#reference-image:focus-visible + .reference-button {
-  outline: 2px solid #aebdd0;
-  outline-offset: 2px;
-}
-
-.reference-button.reference-disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
-}
-
-.reference-clear {
+.file-clear {
   min-width: 30px;
   padding: 0 7px;
   font-size: 18px;

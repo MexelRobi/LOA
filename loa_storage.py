@@ -14,12 +14,10 @@ from typing import Any, TypedDict
 from loa_config import (
     AssistantConfig,
     DEFAULT_IMAGE_GEN_CONFIG,
-    DEFAULT_FLUX_MODEL,
-    DEFAULT_JANUS_MODEL,
-    DEFAULT_SANA_MODEL,
     DEFAULT_COREML_SD_MODEL,
     DEFAULT_MCP_SERVERS,
     DEFAULT_PROMPT,
+    IMAGE_GEN_PROVIDERS,
     default_ollama_host,
     ensure_security_directive,
     is_valid_image_size,
@@ -68,6 +66,11 @@ def skills_directory_path() -> Path:
 def generated_images_directory_path() -> Path:
     """Return the private directory that stores generated image files."""
     return Path.home() / ".loa" / "generated_images"
+
+
+def chat_attachments_directory_path() -> Path:
+    """Return the private directory that stores files attached to chat messages."""
+    return config_file_path().parent / "chat_attachments"
 
 
 def ensure_skills_directory() -> Path:
@@ -557,10 +560,7 @@ def _validate_extension_config(config: AssistantConfig) -> None:
     if not isinstance(image_gen.get("enabled"), bool):
         raise ValueError("Image generation enabled must be a boolean.")
     provider = image_gen.get("provider")
-    if not isinstance(provider, str) or provider not in {
-        "openai", "gemini", "local_janus", "local_flux", "local_sana",
-        "local_coreml_sd",
-    }:
+    if not isinstance(provider, str) or provider not in IMAGE_GEN_PROVIDERS:
         raise ValueError("Invalid image generation provider.")
     if not isinstance(image_gen.get("model"), str) or not image_gen["model"].strip():
         raise ValueError("Image generation model must not be empty.")
@@ -619,12 +619,14 @@ def _normalize_image_gen_config(value: object) -> dict[str, object]:
     model_defaults = {
         "openai": "gpt-image-1",
         "gemini": "gemini-2.5-flash-image",
-        "local_janus": DEFAULT_JANUS_MODEL,
-        "local_flux": DEFAULT_FLUX_MODEL,
-        "local_sana": DEFAULT_SANA_MODEL,
         "local_coreml_sd": DEFAULT_COREML_SD_MODEL,
     }
-    if not isinstance(provider, str) or provider not in model_defaults:
+    if not isinstance(provider, str):
+        raise ValueError("Invalid image generation provider.")
+    if provider in {"local_janus", "local_flux", "local_sana"}:
+        provider = "openai"
+        value = {**value, "model": model_defaults[provider]}
+    if provider not in model_defaults:
         raise ValueError("Invalid image generation provider.")
     defaults.update(
         {

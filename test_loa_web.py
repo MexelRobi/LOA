@@ -1,6 +1,5 @@
-import signal
 import base64
-import io
+import signal
 import http.client
 import concurrent.futures
 import json
@@ -12,6 +11,7 @@ import threading
 import tempfile
 import time
 import unittest
+import base64
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
@@ -21,46 +21,34 @@ import loa_web
 import loa_storage
 
 
-class ReferenceImageUploadTests(unittest.TestCase):
-    def test_chat_rejects_reference_when_image_generation_disabled(self):
-        state = loa_web.WebChatState(loa_web.default_config())
-        state.config["image_gen"].update(enabled=False, provider="local_flux")
+class ChatFileUploadTests(unittest.TestCase):
+    def test_upload_preserves_general_file_bytes_and_private_permissions(self):
+        data = b"print('hello')\n"
         handler = object.__new__(loa_web.LoaRequestHandler)
-        handler.server = SimpleNamespace(state=state)
-        with self.assertRaisesRegex(ValueError, "require enabled image generation"):
-            handler._send_message({"message": "Edit", "image_filename": "a" * 32 + ".png"})
-
-    def test_upload_converts_to_private_png_and_rejects_invalid_data(self):
-        from PIL import Image
-
-        image_bytes = io.BytesIO()
-        Image.new("RGB", (4, 3), "purple").save(image_bytes, format="JPEG")
-        handler = object.__new__(loa_web.LoaRequestHandler)
-        handler.server = SimpleNamespace(state=SimpleNamespace(config={
-            "image_gen": {"enabled": True, "provider": "local_flux"},
-        }))
+        handler.server = SimpleNamespace(state=SimpleNamespace())
         handler._send_json = Mock()
         with tempfile.TemporaryDirectory() as directory:
-            with patch.object(loa_web, "generated_images_directory_path", return_value=Path(directory)):
-                handler._upload_reference_image({
-                    "data": base64.b64encode(image_bytes.getvalue()).decode("ascii"),
+            with patch.object(loa_web, "chat_attachments_directory_path", return_value=Path(directory)):
+                handler._upload_chat_file({
+                    "filename": "example.py",
+                    "data": base64.b64encode(data).decode("ascii"),
                 })
-                filename = handler._send_json.call_args.args[0]["filename"]
-                saved = Path(directory) / filename
+                result = handler._send_json.call_args.args[0]
+                saved = Path(directory) / result["id"]
                 self.assertEqual(saved.stat().st_mode & 0o777, 0o600)
-                with Image.open(saved) as result:
-                    self.assertEqual(result.format, "PNG")
-                    self.assertEqual(result.size, (4, 3))
+                self.assertEqual(saved.read_bytes(), data)
+                self.assertEqual(result["filename"], "example.py")
                 with self.assertRaises(ValueError):
-                    handler._upload_reference_image({"data": "invalid!"})
+                    handler._upload_chat_file({"filename": "bad.txt", "data": "invalid!"})
 
-    def test_upload_route_enforces_enabled_flux_and_authentication(self):
-        from PIL import Image
-
-        image_bytes = io.BytesIO()
-        Image.new("RGB", (1, 1)).save(image_bytes, format="PNG")
-        body = json.dumps({"data": base64.b64encode(image_bytes.getvalue()).decode("ascii")})
+    def test_upload_route_is_independent_of_image_generation_settings(self):
+        file_bytes = b"%PDF-1.7\nfile contents"
+        body = json.dumps({
+            "filename": "report.pdf",
+            "data": base64.b64encode(file_bytes).decode("ascii"),
+        })
         config = loa_web.default_config()
+        config["image_gen"].update(enabled=False)
         state = loa_web.WebChatState(config)
         server = loa_web.LoaHTTPServer(("127.0.0.1", 0), loa_web.LoaRequestHandler, state)
         thread = threading.Thread(target=server.serve_forever)
@@ -69,22 +57,18 @@ class ReferenceImageUploadTests(unittest.TestCase):
         try:
             with (
                 tempfile.TemporaryDirectory() as directory,
-                patch.object(loa_web, "generated_images_directory_path", return_value=Path(directory)),
+                patch.object(loa_web, "chat_attachments_directory_path", return_value=Path(directory)),
                 patch.object(loa_web.LoaRequestHandler, "_authorized", return_value=True) as authorized,
             ):
-                for enabled, provider, expected in (
-                    (False, "local_flux", 400),
-                    (True, "gemini", 400),
-                    (True, "local_flux", 200),
-                ):
-                    state.config["image_gen"].update(enabled=enabled, provider=provider)
-                    connection.request("POST", "/api/images/upload", body, {"Content-Type": "application/json"})
-                    response = connection.getresponse()
-                    self.assertEqual(response.status, expected)
-                    response.read()
-                self.assertEqual(len(list(Path(directory).glob("*.png"))), 1)
+                connection.request("POST", "/api/files/upload", body, {"Content-Type": "application/json"})
+                response = connection.getresponse()
+                self.assertEqual(response.status, 200)
+                result = json.loads(response.read())
+                saved = Path(directory) / result["id"]
+                self.assertEqual(saved.read_bytes(), file_bytes)
+                self.assertEqual(result["filename"], "report.pdf")
                 authorized.return_value = False
-                connection.request("POST", "/api/images/upload", body, {"Content-Type": "application/json"})
+                connection.request("POST", "/api/files/upload", body, {"Content-Type": "application/json"})
                 response = connection.getresponse()
                 self.assertEqual(response.status, 401)
                 response.read()

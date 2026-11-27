@@ -114,8 +114,8 @@ class ScheduledActionExecutionTests(unittest.TestCase):
         )
 
 
-class NonMcpToolCatalogTests(unittest.TestCase):
-    def test_lists_integrated_tools_and_excludes_mcp_tools(self):
+class RuntimeContextTests(unittest.TestCase):
+    def test_system_prompt_includes_all_tools_skills_and_memories(self):
         extra_python_skill = {
             "type": "function",
             "function": {
@@ -137,7 +137,18 @@ class NonMcpToolCatalogTests(unittest.TestCase):
             with (
                 patch("loa_storage.build_chat_catalog", return_value=""),
                 patch("loa_brain.about_me_context", return_value=""),
-                patch("loa_skills.enabled_markdown_skill_instructions", return_value=""),
+                patch("loa_brain.list_brain_entries", return_value=[
+                    {"category": "preference", "content": "Prefers short replies."},
+                ]),
+                patch("loa_skills.list_user_skills", return_value=[
+                    {
+                        "name": "writing.md",
+                        "kind": "md",
+                        "enabled": True,
+                        "command": "/writing",
+                    },
+                ]),
+                patch("loa_skills.enabled_markdown_skill_instructions", return_value="Use concise language."),
             ):
                 prompt = loa_config.build_system_prompt("Base prompt")
 
@@ -153,68 +164,87 @@ class NonMcpToolCatalogTests(unittest.TestCase):
             "remember_brain",
             "cron_job",
             "local_skill_action",
+            "remote_lookup",
         ):
             with self.subTest(tool_name=tool_name):
                 self.assertIn(f"- {tool_name}:", prompt)
-        self.assertNotIn("remote_lookup", prompt)
+        self.assertIn("only when the user's request is directly related", prompt)
+        self.assertIn("Installed user skills:", prompt)
+        self.assertIn("Use concise language.", prompt)
+        self.assertIn("Prefers short replies.", prompt)
 
 
 class ImageGenerationTests(unittest.TestCase):
-    def test_local_flux_edit_uses_reference_and_private_output(self):
+    def test_model_message_sends_images_and_extracted_text_without_model_filtering(self):
         config = loa_config.default_config()
-        config["image_gen"].update(provider="local_flux", model=loa_config.DEFAULT_FLUX_MODEL)
-        cancellation = loa_agent.AgentCancellation()
+        config["model"] = "text-only-model"
+        image_id = "a" * 32
+        text_id = "b" * 32
         with tempfile.TemporaryDirectory() as directory:
-            reference = Path(directory) / ("a" * 32 + ".png")
-            reference.write_bytes(b"reference")
-
-            def fake_runner(arguments, model, cancellation):
-                compile(arguments[2], "<flux-runner>", "exec")
-                self.assertEqual(arguments[-1], str(reference))
-                Path(arguments[-3]).write_bytes(b"\x89PNG\r\n\x1a\nimage")
-                return subprocess.CompletedProcess(arguments, 0)
-
+            attachment_directory = Path(directory)
+            (attachment_directory / image_id).write_bytes(b"image bytes")
+            (attachment_directory / text_id).write_text(
+                "The requested project code.", encoding="utf-8"
+            )
+            client = Mock()
+            client.chat.return_value = {"message": {"content": "Received."}}
+            messages = [
+                {
+                    "role": "user",
+                    "content": "Review these files.",
+                    "attachments": [
+                        {
+                            "id": image_id,
+                            "name": "diagram",
+                            "mime_type": "image/png",
+                        },
+                        {"id": text_id, "name": "source.py", "mime_type": ""},
+                    ],
+                },
+            ]
             with (
-                patch.object(loa_agent, "generated_images_directory_path", return_value=Path(directory)),
-                patch.object(loa_agent.os, "uname", return_value=type("Uname", (), {"machine": "arm64"})()),
-                patch.object(loa_agent, "_run_local_image_process", side_effect=fake_runner) as runner,
+                patch.object(
+                    loa_agent,
+                    "chat_attachments_directory_path",
+                    return_value=attachment_directory,
+                ),
+                patch.object(loa_agent, "build_system_prompt", return_value="system"),
             ):
-                _, ui = loa_agent.generate_image(
-                    config, "Edit this image", "1024x1024", "high",
-                    cancellation, image_filename=reference.name,
+                loa_agent._request_assistant_message(
+                    config, messages, client, plain_chat=True
                 )
-                self.assertEqual(stat.S_IMODE((Path(directory) / ui["filename"]).stat().st_mode), 0o600)
-                self.assertIs(runner.call_args.kwargs["cancellation"], cancellation)
 
-    def test_reference_image_rejects_traversal_and_non_flux_provider(self):
-        config = loa_config.default_config()
-        config["image_gen"].update(provider="local_flux", model=loa_config.DEFAULT_FLUX_MODEL)
-        with self.assertRaisesRegex(ValueError, "Invalid reference"):
-            loa_agent.generate_image(config, "edit", "1024x1024", "high", image_filename="../secret")
-        config["image_gen"]["provider"] = "local_janus"
-        with self.assertRaisesRegex(ValueError, "requires the local FLUX"):
-            loa_agent.generate_image(config, "edit", "1024x1024", "high", image_filename="a" * 32 + ".png")
+        model_message = client.chat.call_args.kwargs["messages"][-1]
+        self.assertIn("The requested project code.", model_message["content"])
+        self.assertEqual(model_message["images"], [str(attachment_directory / image_id)])
+        self.assertNotIn("attachments", model_message)
 
-    def test_sana_runner_passes_requested_size_and_two_steps(self):
-        config = loa_config.default_config()
-        config["image_gen"].update(provider="local_sana", model=loa_config.DEFAULT_SANA_MODEL)
+    def test_pdf_attachment_text_is_extracted(self):
+        from pypdf import PdfWriter
+        from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
 
-        def fake_runner(arguments, model, cancellation):
-            compile(arguments[2], "<sana-runner>", "exec")
-            self.assertEqual(arguments[-2], "1536x1024")
-            self.assertIn("num_inference_steps=2", arguments[2])
-            self.assertIn("SanaSprintPipeline.from_pretrained", arguments[2])
-            Path(arguments[-3]).write_bytes(b"\x89PNG\r\n\x1a\nimage")
-            return subprocess.CompletedProcess(arguments, 0)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "report.pdf"
+            writer = PdfWriter()
+            page = writer.add_blank_page(width=300, height=300)
+            font = writer._add_object(DictionaryObject({
+                NameObject("/Type"): NameObject("/Font"),
+                NameObject("/Subtype"): NameObject("/Type1"),
+                NameObject("/BaseFont"): NameObject("/Helvetica"),
+            }))
+            page[NameObject("/Resources")] = DictionaryObject({
+                NameObject("/Font"): DictionaryObject({NameObject("/F1"): font})
+            })
+            content = DecodedStreamObject()
+            content.set_data(b"BT /F1 12 Tf 10 100 Td (Hello PDF) Tj ET")
+            page[NameObject("/Contents")] = writer._add_object(content)
+            with path.open("wb") as file:
+                writer.write(file)
 
-        with (
-            tempfile.TemporaryDirectory() as directory,
-            patch.object(loa_agent, "generated_images_directory_path", return_value=Path(directory)),
-            patch.object(loa_agent.os, "uname", return_value=type("Uname", (), {"machine": "arm64"})()),
-            patch.object(loa_agent, "_run_local_image_process", side_effect=fake_runner),
-        ):
-            _, ui = loa_agent.generate_image(config, "a tree", "1536x1024", "high")
-            self.assertEqual(ui["provider"], "local_sana")
+            self.assertEqual(
+                loa_agent._read_chat_attachment_text(path, "report.pdf"),
+                "Hello PDF",
+            )
 
     def test_coreml_stable_diffusion_generates_and_resizes_image(self):
         config = loa_config.default_config()
@@ -276,9 +306,15 @@ class ImageGenerationTests(unittest.TestCase):
                 self.assertEqual(timeout, 1800)
                 self.assertEqual(process_memory_limit_bytes, int(1.9 * loa_agent._GIB))
                 progress_path = Path(arguments[-1])
-                progress_path.write_text("1/100", encoding="ascii")
+
+                def write_progress(status):
+                    temporary = progress_path.with_suffix(".tmp")
+                    temporary.write_text(status, encoding="ascii")
+                    os.replace(temporary, progress_path)
+
+                write_progress("1/100")
                 time.sleep(0.1)
-                progress_path.write_text("2/100", encoding="ascii")
+                write_progress("2/100")
                 time.sleep(0.1)
                 return subprocess.CompletedProcess(arguments, 0, "", "")
 
@@ -357,219 +393,6 @@ class ImageGenerationTests(unittest.TestCase):
         self.assertEqual(len(result.stdout), 200000)
         self.assertEqual(len(result.stderr), 200000)
 
-    def test_community_janus_selects_transformers_runner(self):
-        config = loa_config.default_config()
-        config["image_gen"].update(provider="local_janus", model="deepseek-community/Janus-Pro-1B")
-
-        def fake_runner(arguments, model, cancellation):
-            compile(arguments[2], "<community-janus-runner>", "exec")
-            self.assertIn("JanusForConditionalGeneration", arguments[2])
-            self.assertIn('generation_mode="image"', arguments[2])
-            Path(arguments[-3]).write_bytes(b"\x89PNG\r\n\x1a\nimage")
-            return subprocess.CompletedProcess(arguments, 0)
-
-        with (
-            tempfile.TemporaryDirectory() as directory,
-            patch.object(loa_agent, "generated_images_directory_path", return_value=Path(directory)),
-            patch.object(loa_agent, "_run_janus_process", side_effect=fake_runner),
-        ):
-            loa_agent.generate_image(config, "a tree", "1024x1024", "high")
-
-    def test_janus_generation_passes_model_and_cancellation_to_guarded_runner(self):
-        config = loa_config.default_config()
-        config["image_gen"]["provider"] = "local_janus"
-        config["image_gen"]["model"] = "deepseek-ai/Janus-Pro-1B"
-        cancellation = loa_agent.AgentCancellation()
-
-        def fake_runner(arguments, model, cancellation):
-            Path(arguments[-3]).write_bytes(b"\x89PNG\r\n\x1a\nimage")
-            return subprocess.CompletedProcess(arguments, 0)
-
-        with tempfile.TemporaryDirectory() as directory:
-            with (
-                patch.object(loa_agent, "generated_images_directory_path", return_value=Path(directory)),
-                patch.object(loa_agent, "_run_janus_process", side_effect=fake_runner) as runner,
-            ):
-                loa_agent.generate_image(
-                    config, "A purple elephant", "1024x1024", "high", cancellation
-                )
-            self.assertEqual(runner.call_args.kwargs["model"], "deepseek-ai/Janus-Pro-1B")
-            self.assertIs(runner.call_args.kwargs["cancellation"], cancellation)
-
-    def test_janus_readiness_uses_cancellable_import_check(self):
-        config = loa_config.default_config()
-        config["image_gen"]["provider"] = "local_janus"
-        config["image_gen"]["model"] = "deepseek-ai/Janus-Pro-1B"
-        cancellation = loa_agent.AgentCancellation()
-        with (
-            patch.object(loa_agent, "_check_janus_memory"),
-            patch.object(
-                loa_agent,
-                "_run_cancellable_process",
-                return_value=subprocess.CompletedProcess([], 0),
-            ) as runner,
-        ):
-            result = loa_agent.check_image_generation_readiness(config, cancellation)
-        self.assertIn("readiness check passed", result)
-        self.assertIs(runner.call_args.kwargs["cancellation"], cancellation)
-        self.assertEqual(runner.call_args.kwargs["timeout"], 60)
-
-    def test_janus_runner_uses_image_token_head_and_initializes_model(self):
-        stub = r'''
-import sys, types, torch
-from types import SimpleNamespace
-
-torch.backends.mps.is_available = lambda: False
-janus = types.ModuleType("janus")
-models = types.ModuleType("janus.models")
-
-class Tokenizer:
-    def encode(self, prompt):
-        assert prompt.endswith("<image>")
-        return [1, 2, 3]
-
-class Processor:
-    tokenizer = Tokenizer()
-    image_start_tag = "<image>"
-    pad_id = 0
-    sft_format = "test"
-
-    @classmethod
-    def from_pretrained(cls, model):
-        return cls()
-
-    def apply_sft_template_for_multi_turn_prompts(self, conversation, **kwargs):
-        assert conversation[0]["role"] == "<|User|>"
-        assert conversation[1]["role"] == "<|Assistant|>"
-        return "prompt"
-
-class Language:
-    def get_input_embeddings(self):
-        return lambda ids: torch.zeros((*ids.shape, 2))
-
-    def model(self, inputs_embeds, past_key_values, use_cache):
-        assert inputs_embeds.shape[0] == 2
-        return SimpleNamespace(
-            last_hidden_state=torch.zeros((2, 1, 2)),
-            past_key_values=1,
-        )
-
-class Decoder:
-    def decode_code(self, tokens, shape):
-        assert tokens.shape == (1, 576)
-        assert shape == [1, 8, 24, 24]
-        assert (tokens == 0).all()
-        return torch.zeros((1, 3, 384, 384))
-
-class Model:
-    def __init__(self, config):
-        self.language_model = Language()
-        self.gen_vision_model = Decoder()
-
-    def get_expanded_tied_weights_keys(self):
-        return {}
-
-    def post_init(self):
-        self.all_tied_weights_keys = {}
-
-    @classmethod
-    def from_pretrained(cls, *args, **kwargs):
-        instance = cls(None)
-        assert instance.all_tied_weights_keys == {}
-        return instance
-
-    def to(self, **kwargs):
-        return self
-
-    def eval(self):
-        return self
-
-    def gen_head(self, hidden):
-        return torch.tensor([[10.0, -100.0], [10.0, -100.0]])
-
-    def prepare_gen_img_embeds(self, tokens):
-        return torch.zeros((2, 2))
-
-models.MultiModalityCausalLM = Model
-models.VLChatProcessor = Processor
-janus.models = models
-sys.modules["janus"] = janus
-sys.modules["janus.models"] = models
-'''
-        config = loa_config.default_config()
-        config["image_gen"]["provider"] = "local_janus"
-        config["image_gen"]["model"] = "fake-model"
-        with tempfile.TemporaryDirectory() as directory:
-            def run_fake_janus(arguments, cancellation, timeout, memory_guard=None):
-                return subprocess.run(
-                    [sys.executable, "-c", stub + arguments[2], *arguments[3:]],
-                    capture_output=True,
-                    text=True,
-                    timeout=60,
-                )
-
-            with (
-                patch.object(
-                    loa_agent,
-                    "generated_images_directory_path",
-                    return_value=Path(directory),
-                ),
-                patch.object(loa_agent, "_run_cancellable_process", side_effect=run_fake_janus),
-                patch.object(loa_agent, "_check_janus_memory"),
-            ):
-                _, ui = loa_agent.generate_image(
-                    config, "A purple elephant", "1024x1024", "high"
-                )
-            from PIL import Image
-
-            with Image.open(Path(directory) / ui["filename"]) as image:
-                self.assertEqual(image.size, (1024, 1024))
-                self.assertEqual(image.getpixel((0, 0)), (127, 127, 127))
-
-    def test_janus_rejects_7b_on_16gb_mac_before_start(self):
-        memory = subprocess.CompletedProcess([], 0, stdout=str(16 * 1024 ** 3))
-        with (
-            patch.object(loa_agent.sys, "platform", "darwin"),
-            patch.object(loa_agent.subprocess, "run", return_value=memory),
-            patch.object(loa_agent, "_mac_memory_available") as available,
-        ):
-            with self.assertRaisesRegex(RuntimeError, "Janus-Pro-1B"):
-                loa_agent._check_janus_memory("deepseek-ai/Janus-Pro-7B")
-            available.assert_not_called()
-
-    def test_janus_memory_estimate_counts_free_and_reclaimable_pages(self):
-        stats = subprocess.CompletedProcess(
-            [], 0, stdout=(
-                "Mach Virtual Memory Statistics: (page size of 16384 bytes)\n"
-                "Pages free: 100.\nPages inactive: 80.\nFile-backed pages: 50.\n"
-            )
-        )
-        with patch.object(loa_agent.subprocess, "run", return_value=stats):
-            self.assertEqual(loa_agent._mac_memory_available(), 150 * 16384)
-
-    def test_new_janus_config_defaults_to_1b(self):
-        settings = loa_storage._normalize_image_gen_config({"provider": "local_janus"})
-        self.assertEqual(settings["model"], "deepseek-ai/Janus-Pro-1B")
-
-    def test_janus_rejects_low_available_memory(self):
-        memory = subprocess.CompletedProcess([], 0, stdout=str(16 * 1024 ** 3))
-        with (
-            patch.object(loa_agent.sys, "platform", "darwin"),
-            patch.object(loa_agent.subprocess, "run", return_value=memory),
-            patch.object(loa_agent, "_mac_memory_available", return_value=4 * 1024 ** 3),
-        ):
-            with self.assertRaisesRegex(RuntimeError, "Close memory-intensive apps"):
-                loa_agent._check_janus_memory("deepseek-ai/Janus-Pro-1B")
-
-    def test_janus_allows_1b_with_sufficient_memory(self):
-        memory = subprocess.CompletedProcess([], 0, stdout=str(16 * 1024 ** 3))
-        with (
-            patch.object(loa_agent.sys, "platform", "darwin"),
-            patch.object(loa_agent.subprocess, "run", return_value=memory),
-            patch.object(loa_agent, "_mac_memory_available", return_value=9 * 1024 ** 3),
-        ):
-            loa_agent._check_janus_memory("deepseek-ai/Janus-Pro-1B")
-
     def test_total_memory_check_uses_absolute_sysctl_path(self):
         memory = subprocess.CompletedProcess([], 0, stdout=str(16 * 1024 ** 3))
         with (
@@ -582,54 +405,6 @@ sys.modules["janus.models"] = models
             )
         self.assertEqual(run.call_args.args[0][0], "/usr/sbin/sysctl")
 
-    def test_sana_memory_limit_applies_to_readiness_and_generation(self):
-        config = loa_config.default_config()
-        config["image_gen"].update(provider="local_sana", model=loa_config.DEFAULT_SANA_MODEL)
-        memory = subprocess.CompletedProcess([], 0, stdout=str(16 * 1024 ** 3))
-        with (
-            patch.object(loa_agent.sys, "platform", "darwin"),
-            patch.object(loa_agent.os, "uname", return_value=type("Uname", (), {"machine": "arm64"})()),
-            patch.object(loa_agent.subprocess, "run", return_value=memory),
-            patch.object(loa_agent, "_mac_memory_available", return_value=int(5.2 * 1024 ** 3)) as available,
-            patch.object(loa_agent, "_run_cancellable_process", return_value=subprocess.CompletedProcess([], 0)),
-        ):
-            loa_agent.check_image_generation_readiness(config)
-            loa_agent._run_local_image_process([], loa_config.DEFAULT_SANA_MODEL, None)
-            available.return_value = 2 * 1024 ** 3 - 1
-            with self.assertRaisesRegex(RuntimeError, "requires 2 GiB"):
-                loa_agent.check_image_generation_readiness(config)
-            with self.assertRaisesRegex(RuntimeError, "requires 2 GiB"):
-                loa_agent._run_local_image_process([], loa_config.DEFAULT_SANA_MODEL, None)
-
-    def test_flux_memory_limit_applies_to_readiness_and_generation(self):
-        config = loa_config.default_config()
-        config["image_gen"].update(provider="local_flux", model=loa_config.DEFAULT_FLUX_MODEL)
-        memory = subprocess.CompletedProcess([], 0, stdout=str(16 * 1024 ** 3))
-        with (
-            patch.object(loa_agent.sys, "platform", "darwin"),
-            patch.object(loa_agent.os, "uname", return_value=type("Uname", (), {"machine": "arm64"})()),
-            patch.object(loa_agent.subprocess, "run", return_value=memory),
-            patch.object(loa_agent, "_mac_memory_available", return_value=3 * 1024 ** 3) as available,
-            patch.object(loa_agent, "_run_cancellable_process", return_value=subprocess.CompletedProcess([], 0)),
-        ):
-            loa_agent.check_image_generation_readiness(config)
-            loa_agent._run_local_image_process([], loa_config.DEFAULT_FLUX_MODEL, None)
-            available.return_value = 3 * 1024 ** 3 - 1
-            with self.assertRaisesRegex(RuntimeError, "requires 3 GiB"):
-                loa_agent.check_image_generation_readiness(config)
-            with self.assertRaisesRegex(RuntimeError, "requires 3 GiB"):
-                loa_agent._run_local_image_process([], loa_config.DEFAULT_FLUX_MODEL, None)
-
-    def test_memory_guard_stops_running_process(self):
-        def guard():
-            raise RuntimeError("memory pressure")
-
-        with self.assertRaisesRegex(RuntimeError, "memory pressure"):
-            loa_agent._run_cancellable_process(
-                [sys.executable, "-c", "import time; time.sleep(20)"],
-                memory_guard=guard,
-            )
-
     def test_process_memory_limit_stops_process_over_limit(self):
         with (
             patch.object(loa_agent, "_process_rss_bytes", return_value=2),
@@ -638,44 +413,6 @@ sys.modules["janus.models"] = models
             loa_agent._run_cancellable_process(
                 [sys.executable, "-c", "import time; time.sleep(20)"],
                 process_memory_limit_bytes=1,
-            )
-
-    def test_janus_rejects_concurrent_generation(self):
-        loa_agent._LOCAL_IMAGE_GENERATION_LOCK.acquire()
-        try:
-            with self.assertRaisesRegex(RuntimeError, "already running"):
-                loa_agent._run_janus_process([], "deepseek-ai/Janus-Pro-1B", None)
-        finally:
-            loa_agent._LOCAL_IMAGE_GENERATION_LOCK.release()
-
-    def test_janus_runner_honors_explicit_venv_interpreter(self):
-        with tempfile.TemporaryDirectory() as directory:
-            interpreter = Path(directory) / "bin" / "python"
-            interpreter.parent.mkdir()
-            interpreter.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-            interpreter.chmod(0o700)
-            with patch.dict(
-                os.environ,
-                {"LOA_JANUS_PYTHON": str(interpreter), "VIRTUAL_ENV": ""},
-            ):
-                self.assertEqual(
-                    loa_agent._janus_python_executable(),
-                    str(interpreter),
-                )
-
-    def test_janus_runner_uses_project_venv_automatically(self):
-        project_venv_python = (
-            Path(loa_agent.__file__).resolve().parent / ".venv" / "bin" / "python"
-        )
-        if not project_venv_python.is_file():
-            self.skipTest("Project virtual environment is not present.")
-        with patch.dict(
-            os.environ,
-            {"LOA_JANUS_PYTHON": "", "VIRTUAL_ENV": ""},
-        ):
-            self.assertEqual(
-                loa_agent._janus_python_executable(),
-                str(project_venv_python),
             )
 
     def test_image_tool_is_available_only_when_enabled(self):
@@ -1001,6 +738,26 @@ sys.modules["janus.models"] = models
         config["image_gen"]["provider"] = "diffusion"
         with self.assertRaisesRegex(ValueError, "provider"):
             loa_storage.save_config(config)
+
+    def test_image_generation_supports_only_the_three_requested_providers(self):
+        self.assertEqual(
+            loa_config.IMAGE_GEN_PROVIDERS,
+            {"openai", "gemini", "local_coreml_sd"},
+        )
+        for provider in loa_config.IMAGE_GEN_PROVIDERS:
+            config = loa_config.default_config()
+            config["image_gen"]["provider"] = provider
+            loa_storage._validate_extension_config(config)
+
+    def test_retired_local_provider_settings_migrate_to_openai_defaults(self):
+        for provider in ("local_janus", "local_flux", "local_sana"):
+            with self.subTest(provider=provider):
+                settings = loa_storage._normalize_image_gen_config({
+                    "provider": provider,
+                    "model": "retired-model",
+                })
+                self.assertEqual(settings["provider"], "openai")
+                self.assertEqual(settings["model"], "gpt-image-1")
 
 
 if __name__ == "__main__":

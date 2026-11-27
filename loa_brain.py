@@ -138,7 +138,9 @@ def add_brain_entry(content: str, category: str = "fact") -> dict[str, Any]:
     return entry
 
 
-def list_brain_entries(query: str = "", limit: int = 200) -> list[dict[str, Any]]:
+def list_brain_entries(
+    query: str = "", limit: int | None = 200
+) -> list[dict[str, Any]]:
     if not isinstance(query, str):
         raise ValueError("Brain search query must be text.")
     query = query.strip()
@@ -149,18 +151,18 @@ def list_brain_entries(query: str = "", limit: int = 200) -> list[dict[str, Any]
                 if not terms:
                     return []
                 match = " OR ".join(f'"{term.replace(chr(34), chr(34) * 2)}"' for term in terms)
-                rows = connection.execute(
-                    """SELECT e.* FROM brain_search AS f
+                statement = """SELECT e.* FROM brain_search AS f
                     JOIN brain_entries AS e ON e.id = f.entry_id
                     WHERE brain_search MATCH ?
-                    ORDER BY bm25(brain_search), e.created_at DESC, e.rowid DESC LIMIT ?""",
-                    (match, min(max(limit, 1), 500)),
-                ).fetchall()
+                    ORDER BY bm25(brain_search), e.created_at DESC, e.rowid DESC"""
+                parameters: tuple[Any, ...] = (match,)
             else:
-                rows = connection.execute(
-                    "SELECT * FROM brain_entries ORDER BY created_at DESC, rowid DESC LIMIT ?",
-                    (min(max(limit, 1), 500),),
-                ).fetchall()
+                statement = "SELECT * FROM brain_entries ORDER BY created_at DESC, rowid DESC"
+                parameters = ()
+            if limit is not None:
+                statement += " LIMIT ?"
+                parameters += (min(max(limit, 1), 500),)
+            rows = connection.execute(statement, parameters).fetchall()
     except sqlite3.Error as error:
         raise RuntimeError(f"Could not search the local Brain database: {error}") from error
     return [_entry_from_row(row) for row in rows]

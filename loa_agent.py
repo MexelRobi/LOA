@@ -18,6 +18,9 @@ from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Callable, TypedDict
 from urllib.parse import quote, urlsplit
+import mimetypes
+import zipfile
+from xml.etree import ElementTree
 
 from ddgs import DDGS
 from ddgs.exceptions import DDGSException
@@ -26,11 +29,9 @@ import ollama
 
 from loa_config import (
     AssistantConfig,
-    DEFAULT_FLUX_MODEL,
-    DEFAULT_JANUS_MODEL,
-    DEFAULT_SANA_MODEL,
     DEFAULT_COREML_SD_MODEL,
     DEFAULT_COREML_SD_REVISION,
+    IMAGE_GEN_PROVIDERS,
     DEFAULT_OLLAMA_HOST,
     build_system_prompt,
     is_valid_image_size,
@@ -47,6 +48,7 @@ from loa_cron import (
 from loa_mcp import is_sensitive_path, mcp_manager
 from loa_skills import load_python_skill_tools
 from loa_storage import (
+    chat_attachments_directory_path,
     find_saved_chat_id,
     recall_past_chat,
     generated_images_directory_path,
@@ -523,14 +525,6 @@ TOOLS = [
                         "type": "string",
                         "enum": ["low", "medium", "high"],
                     },
-                    "image_filename": {
-                        "type": "string",
-                        "description": (
-                            "Optional reference image filename supplied by the user "
-                            "or returned by a previous image generation. "
-                            "Supported only by local FLUX image editing."
-                        ),
-                    },
                 },
                 "required": ["prompt"],
             },
@@ -943,6 +937,118 @@ def format_search_results(results: list[dict[str, str]]) -> str:
     )
 
 
+def _read_chat_attachment_text(
+    path: Path, filename: str, mime_type: str = ""
+) -> str:
+    suffix = Path(filename).suffix.casefold()
+    try:
+        if suffix == ".pdf" or mime_type == "application/pdf":
+            from pypdf import PdfReader
+            from pypdf.errors import FileNotDecryptedError, PdfReadError
+
+            try:
+                return "\n\n".join(page.extract_text() or "" for page in PdfReader(path).pages)
+            except (OSError, ValueError, FileNotDecryptedError, PdfReadError) as error:
+                raise RuntimeError(f"Could not extract text from {filename}: {error}") from error
+        office_suffixes = {
+            ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            ".odt": "application/vnd.oasis.opendocument.text",
+        }
+        office_suffix = suffix if suffix in office_suffixes else next(
+            (
+                extension for extension, office_type in office_suffixes.items()
+                if mime_type == office_type
+            ),
+            "",
+        )
+        if office_suffix in office_suffixes:
+            with zipfile.ZipFile(path) as archive:
+                if office_suffix == ".docx":
+                    names = [
+                        name for name in archive.namelist()
+                        if name == "word/document.xml"
+                        or name.startswith(("word/header", "word/footer"))
+                    ]
+                elif office_suffix == ".pptx":
+                    names = [
+                        name for name in archive.namelist()
+                        if re.fullmatch(r"ppt/slides/slide\d+\.xml", name)
+                    ]
+                elif office_suffix == ".xlsx":
+                    names = [
+                        name for name in archive.namelist()
+                        if name == "xl/sharedStrings.xml"
+                        or re.fullmatch(r"xl/worksheets/sheet\d+\.xml", name)
+                    ]
+                else:
+                    names = ["content.xml"]
+                sections = []
+                for name in sorted(names):
+                    root = ElementTree.fromstring(archive.read(name))
+                    sections.extend(
+                        node.text for node in root.iter()
+                        if node.tag.rsplit("}", 1)[-1] in {"t", "v"}
+                        and node.text
+                    )
+                return "\n".join(sections)
+        return path.read_text(encoding="utf-8-sig")
+    except (OSError, UnicodeError, zipfile.BadZipFile, KeyError, ElementTree.ParseError) as error:
+        raise RuntimeError(
+            f"Could not read {filename} as text. Use a text-based document or PDF."
+        ) from error
+
+
+def _model_message(message: ChatMessage) -> ChatMessage:
+    """Resolve saved file references into Ollama's native text and image inputs."""
+    model_message = {
+        key: value
+        for key, value in message.items()
+        if key not in {"ui", "attachments"}
+    }
+    attachments = message.get("attachments", [])
+    if not attachments:
+        return model_message
+    if not isinstance(attachments, list):
+        raise ValueError("Chat attachments must be a list.")
+
+    content = str(model_message.get("content") or "")
+    image_paths: list[str] = []
+    directory = chat_attachments_directory_path()
+    for attachment in attachments:
+        if not isinstance(attachment, dict):
+            raise ValueError("Chat attachment metadata is invalid.")
+        attachment_id = attachment.get("id")
+        filename = attachment.get("name")
+        mime_type = attachment.get("mime_type", "")
+        if (
+            not isinstance(attachment_id, str)
+            or re.fullmatch(r"[a-f0-9]{32}", attachment_id) is None
+            or not isinstance(filename, str)
+            or not filename
+            or not isinstance(mime_type, str)
+        ):
+            raise ValueError("Chat attachment metadata is invalid.")
+        path = directory / attachment_id
+        if not path.is_file():
+            raise ValueError(f"Attached file was not found: {filename}.")
+        mime_type = mimetypes.guess_type(filename)[0] or mime_type
+        if mime_type.startswith("image/"):
+            image_paths.append(str(path))
+            content += f"\n[Image attachment: {filename}]"
+        else:
+            file_content = _read_chat_attachment_text(path, filename, mime_type)
+            content += (
+                f"\n\n[Untrusted attachment: {filename}]\n"
+                f"{file_content}\n[End of attachment]"
+            )
+    model_message["content"] = content
+    if image_paths:
+        model_message["images"] = image_paths
+    return model_message
+
+
 def _request_assistant_message(
     config: AssistantConfig,
     messages: list[ChatMessage],
@@ -952,10 +1058,7 @@ def _request_assistant_message(
     plain_chat: bool = False,
 ) -> tuple[object, bool]:
     """Request one response, retrying without tools for incompatible models."""
-    model_messages = [
-        {key: value for key, value in message.items() if key != "ui"}
-        for message in messages
-    ]
+    model_messages = [_model_message(message) for message in messages]
     system_message = {
         "role": "system",
         "content": build_system_prompt(
@@ -1147,8 +1250,8 @@ def configure_runtime_tools(
     return mcp_manager.statuses()
 
 
-def non_mcp_tool_catalog() -> str:
-    """Describe built-in and Python skill tools without listing MCP tools."""
+def runtime_tool_catalog() -> str:
+    """Describe every tool currently exposed to the assistant."""
     catalog: list[str] = []
     for schema in TOOLS:
         function = schema.get("function")
@@ -1156,13 +1259,8 @@ def non_mcp_tool_catalog() -> str:
             continue
         name = function.get("name")
         description = function.get("description")
-        if (
-            not isinstance(name, str)
-            or name in MCP_TOOL_NAMES
-            or not isinstance(description, str)
-        ):
-            continue
-        catalog.append(f"- {name}: {description}")
+        if isinstance(name, str) and isinstance(description, str):
+            catalog.append(f"- {name}: {description}")
     return "\n".join(catalog)
 
 
@@ -1925,24 +2023,12 @@ def get_assistant_reply(
                     "low", "medium", "high"
                 }:
                     raise ValueError("The requested image quality is not supported.")
-                reference = arguments.get("image_filename")
-                if reference is not None and (
-                    not isinstance(reference, str)
-                    or not any(
-                        isinstance(message.get("ui"), dict)
-                        and message["ui"].get("filename") == reference
-                        and message["ui"].get("type") in {"image", "reference_image"}
-                        for message in history
-                    )
-                ):
-                    raise ValueError("The reference image is not part of this conversation.")
                 image_result, image_ui = generate_image(
                     config,
                     prompt.strip(),
                     image_size,
                     quality,
                     cancellation,
-                    **({"image_filename": reference} if reference is not None else {}),
                     **(
                         {"progress_callback": progress_callback}
                         if progress_callback is not None
@@ -2246,39 +2332,6 @@ def _image_generation_api_key(settings: dict[str, Any], provider: str) -> str:
     )
 
 
-def _janus_python_executable() -> str:
-    """Find the Python environment that contains LOA's optional local model packages."""
-    candidates: list[Path] = []
-    configured_python = os.environ.get("LOA_JANUS_PYTHON", "").strip()
-    if configured_python:
-        candidates.append(Path(configured_python).expanduser())
-
-    virtual_env = os.environ.get("VIRTUAL_ENV", "").strip()
-    if virtual_env:
-        candidates.append(_venv_python_path(Path(virtual_env).expanduser()))
-
-    project_directory = Path(__file__).resolve().parent
-    launch_directory = Path(sys.argv[0]).resolve().parent
-    for anchor in (Path.cwd(), launch_directory, project_directory):
-        for directory in (anchor, *list(anchor.parents)[:3]):
-            candidates.append(_venv_python_path(directory / ".venv"))
-    if sys.prefix != sys.base_prefix:
-        candidates.append(Path(sys.executable))
-    candidates.append(Path(sys.executable))
-
-    for candidate in candidates:
-        if candidate.is_file() and os.access(candidate, os.X_OK):
-            return str(candidate)
-    return sys.executable
-
-
-def _venv_python_path(virtual_env: Path) -> Path:
-    """Return the platform-specific Python executable path for a virtualenv."""
-    if os.name == "nt":
-        return virtual_env / "Scripts" / "python.exe"
-    return virtual_env / "bin" / "python"
-
-
 _LOCAL_IMAGE_GENERATION_LOCK = threading.Lock()
 _GIB = 1024 ** 3
 
@@ -2289,7 +2342,9 @@ def _mac_memory_available() -> int:
             ["vm_stat"], capture_output=True, text=True, check=True, timeout=5
         ).stdout
     except (OSError, subprocess.SubprocessError) as error:
-        raise RuntimeError(f"Could not check macOS memory before Janus: {error}") from error
+        raise RuntimeError(
+            f"Could not check macOS memory before local image generation: {error}"
+        ) from error
     page_size = re.search(r"page size of (\d+) bytes", output)
     pages = {
         name: int(count)
@@ -2300,23 +2355,9 @@ def _mac_memory_available() -> int:
         )
     }
     if page_size is None or len(pages) != 3:
-        raise RuntimeError("Could not interpret macOS memory statistics for Janus.")
+        raise RuntimeError("Could not interpret macOS memory statistics.")
     reclaimable = min(pages["Pages inactive"], pages["File-backed pages"])
     return int(page_size.group(1)) * (pages["Pages free"] + reclaimable)
-
-
-def _check_janus_memory(model: str) -> None:
-    if sys.platform != "darwin":
-        return
-    name = model.rstrip("/").rsplit("/", 1)[-1].casefold()
-    if name not in {"janus-pro-1b", "janus-pro-7b"}:
-        raise RuntimeError(
-            "Cannot estimate memory for this Janus model. Select "
-            f"{DEFAULT_JANUS_MODEL} in Image Gen settings."
-        )
-    minimum_total = (32 if name == "janus-pro-7b" else 8) * _GIB
-    minimum_available = (24 if name == "janus-pro-7b" else 8) * _GIB
-    _check_local_image_memory(model, minimum_total, minimum_available)
 
 
 def _check_local_image_memory(
@@ -2339,7 +2380,7 @@ def _check_local_image_memory(
     if total < minimum_total:
         raise RuntimeError(
             f"{model} needs at least {minimum_total // _GIB} GiB RAM for LOA's "
-            f"memory safety check. Select a smaller model such as {DEFAULT_JANUS_MODEL}."
+            "memory safety check."
         )
     available = _mac_memory_available()
     if available < minimum_available:
@@ -2348,14 +2389,6 @@ def _check_local_image_memory(
             f"{available / _GIB:.1f} GiB is available; LOA requires "
             f"{minimum_available // _GIB} GiB. Close memory-intensive apps "
             "before retrying."
-        )
-
-
-def _check_janus_running_memory() -> None:
-    if _mac_memory_available() < 2 * _GIB:
-        raise RuntimeError(
-            "Local image generation was stopped to protect the system: available memory "
-            "fell below 2 GiB. Close memory-intensive apps before retrying."
         )
 
 
@@ -2543,67 +2576,6 @@ def _run_coreml_sd_process(
         _LOCAL_IMAGE_GENERATION_LOCK.release()
 
 
-def _run_janus_process(
-    arguments: list[str],
-    model: str,
-    cancellation: AgentCancellation | None,
-) -> subprocess.CompletedProcess[str]:
-    if not _LOCAL_IMAGE_GENERATION_LOCK.acquire(blocking=False):
-        raise RuntimeError("Another local image generation is already running.")
-    try:
-        _check_janus_memory(model)
-        return _run_cancellable_process(
-            arguments,
-            cancellation,
-            timeout=1800,
-            memory_guard=_check_janus_running_memory if sys.platform == "darwin" else None,
-        )
-    finally:
-        _LOCAL_IMAGE_GENERATION_LOCK.release()
-
-
-def _run_local_image_process(
-    arguments: list[str], model: str, cancellation: AgentCancellation | None
-) -> subprocess.CompletedProcess[str]:
-    if not _LOCAL_IMAGE_GENERATION_LOCK.acquire(blocking=False):
-        raise RuntimeError("Another local image generation is already running.")
-    try:
-        _check_local_image_memory(
-            model, 8 * _GIB, (2 if model == DEFAULT_SANA_MODEL else 3) * _GIB
-        )
-        return _run_cancellable_process(
-            arguments,
-            cancellation,
-            timeout=1800,
-            memory_guard=_check_janus_running_memory if sys.platform == "darwin" else None,
-        )
-    finally:
-        _LOCAL_IMAGE_GENERATION_LOCK.release()
-
-
-# Janus config classes use mutable defaults that recent Python rejects as dataclasses.
-_JANUS_PYTHON_COMPATIBILITY = r'''
-import dataclasses
-import transformers.configuration_utils as configuration_utils
-
-original_dataclass = getattr(
-    configuration_utils, "dataclass", dataclasses.dataclass
-)
-def compatible_dataclass(cls, *args, **kwargs):
-    for field_name in getattr(cls, "__annotations__", {}):
-        default = vars(cls).get(field_name)
-        if isinstance(default, (dict, list, set)):
-            setattr(
-                cls,
-                field_name,
-                dataclasses.field(default_factory=type(default)),
-            )
-    return original_dataclass(cls, *args, **kwargs)
-
-configuration_utils.dataclass = compatible_dataclass
-'''
-
-
 def _image_generation_http_json(
     method: str,
     url: str,
@@ -2670,7 +2642,7 @@ def check_image_generation_readiness(
     config: AssistantConfig,
     cancellation: AgentCancellation | None = None,
 ) -> str:
-    """Check provider credentials/connectivity or local Janus dependencies."""
+    """Check provider credentials/connectivity or Apple SD readiness."""
     settings = config.get("image_gen", {})
     if not isinstance(settings, dict) or settings.get("enabled") is not True:
         raise ValueError("Image generation is disabled in Settings > Image Gen.")
@@ -2678,72 +2650,11 @@ def check_image_generation_readiness(
     model = settings.get("model")
     if (
         not isinstance(provider, str)
-        or provider not in {
-            "openai", "gemini", "local_janus", "local_flux", "local_sana",
-            "local_coreml_sd",
-        }
+        or provider not in IMAGE_GEN_PROVIDERS
         or not isinstance(model, str)
         or not model.strip()
     ):
         raise ValueError("Choose a valid image generation provider and model.")
-    if provider == "local_janus":
-        _check_janus_memory(model.strip())
-        python_executable = _janus_python_executable()
-        imports = (
-            "import torch; from PIL import Image, ImageOps; "
-            "from transformers import JanusForConditionalGeneration, JanusProcessor"
-            if model.strip().casefold() == "deepseek-community/janus-pro-1b"
-            else _JANUS_PYTHON_COMPATIBILITY
-            + "\nimport torch; from PIL import Image, ImageOps; "
-            "from janus.models import MultiModalityCausalLM, VLChatProcessor"
-        )
-        result = _run_cancellable_process(
-            [
-                python_executable,
-                "-c",
-                imports,
-            ],
-            cancellation=cancellation,
-            timeout=60,
-        )
-        if result.returncode != 0:
-            output = (result.stderr or result.stdout).strip()
-            raise RuntimeError(
-                "Janus could not be loaded from LOA's Python environment "
-                f"({python_executable}): {output[-1600:] or 'unknown import error'}. "
-                "Set LOA_JANUS_PYTHON to the venv interpreter containing Janus, "
-                "PyTorch, Transformers, and Pillow."
-            )
-        return f"Local Janus readiness check passed for {model}."
-
-    if provider in {"local_flux", "local_sana"}:
-        expected_model = DEFAULT_FLUX_MODEL if provider == "local_flux" else DEFAULT_SANA_MODEL
-        if model.strip() != expected_model:
-            raise ValueError(f"{provider} supports {expected_model}.")
-        if sys.platform != "darwin" or os.uname().machine != "arm64":
-            raise RuntimeError(f"{provider} requires an Apple Silicon Mac.")
-        _check_local_image_memory(
-            model.strip(), 8 * _GIB, (2 if provider == "local_sana" else 3) * _GIB
-        )
-        imports = (
-            "from mflux.models.common.config import ModelConfig; "
-            "from mflux.models.flux2.variants import Flux2Klein, Flux2KleinEdit"
-            if provider == "local_flux"
-            else "import torch; from diffusers import SanaSprintPipeline; "
-            "assert torch.backends.mps.is_available(), 'Apple MPS is unavailable'"
-        )
-        try:
-            result = _run_cancellable_process(
-                [_janus_python_executable(), "-c", imports],
-                cancellation=cancellation,
-                timeout=60,
-            )
-        except subprocess.TimeoutExpired as error:
-            raise RuntimeError(f"{provider} readiness check timed out after 60 seconds.") from error
-        if result.returncode:
-            output = (result.stderr or result.stdout).strip()
-            raise RuntimeError(f"{provider} is not ready in LOA's venv: {output[-1600:]}")
-        return f"Local {provider} dependencies are ready for {model}. Model weights may still need downloading."
 
     if provider == "local_coreml_sd":
         if model.strip() != DEFAULT_COREML_SD_MODEL:
@@ -2784,7 +2695,6 @@ def generate_image(
     size: str,
     quality: str,
     cancellation: AgentCancellation | None = None,
-    image_filename: str | None = None,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> tuple[str, dict[str, Any]]:
     """Generate an image through the configured provider and persist it."""
@@ -2800,10 +2710,7 @@ def generate_image(
     model = settings.get("model")
     if (
         not isinstance(provider, str)
-        or provider not in {
-            "openai", "gemini", "local_janus", "local_flux", "local_sana",
-            "local_coreml_sd",
-        }
+        or provider not in IMAGE_GEN_PROVIDERS
     ):
         raise ValueError("Choose a valid image generation provider.")
     if not is_valid_image_size(size, provider):
@@ -2815,16 +2722,6 @@ def generate_image(
         raise ValueError("The requested image size is not supported.")
     if not isinstance(model, str) or not model.strip():
         raise ValueError("Image generation model must not be empty.")
-    reference_path = None
-    if image_filename is not None:
-        if provider != "local_flux":
-            raise ValueError("Reference image editing requires the local FLUX provider.")
-        if not isinstance(image_filename, str) or re.fullmatch(r"[a-f0-9]{32}\.png", image_filename) is None:
-            raise ValueError("Invalid reference image filename.")
-        reference_path = generated_images_directory_path() / image_filename
-        if not reference_path.is_file():
-            raise ValueError("Reference image was not found.")
-
     image_path = generated_images_directory_path() / f"{uuid.uuid4().hex}.png"
     image_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     image_path.parent.chmod(0o700)
@@ -2905,201 +2802,6 @@ def generate_image(
             finally:
                 resized_path.unlink(missing_ok=True)
             report_progress(step_count, step_count, "Finished")
-        elif provider in {"local_flux", "local_sana"}:
-            expected_model = DEFAULT_FLUX_MODEL if provider == "local_flux" else DEFAULT_SANA_MODEL
-            if model.strip() != expected_model:
-                raise ValueError(f"{provider} supports {expected_model}.")
-            if sys.platform != "darwin" or os.uname().machine != "arm64":
-                raise RuntimeError(f"{provider} requires an Apple Silicon Mac.")
-            image_script = r'''
-import os
-import sys
-from PIL import Image
-
-provider, model_path, prompt, output_path, size, reference = sys.argv[1:]
-width, height = (int(value) for value in size.split("x"))
-if provider == "local_flux":
-    from mflux.models.common.config import ModelConfig
-    from mflux.models.flux2.variants import Flux2Klein, Flux2KleinEdit
-    cls = Flux2KleinEdit if reference else Flux2Klein
-    model = cls(model_config=ModelConfig.flux2_klein_4b(), model_path=model_path)
-    options = {"image_paths": [reference]} if reference else {}
-    image = model.generate_image(
-        prompt=prompt, seed=int.from_bytes(os.urandom(4), "big"),
-        width=width, height=height, num_inference_steps=4, **options,
-    ).image
-else:
-    import torch
-    from diffusers import SanaSprintPipeline
-    if not torch.backends.mps.is_available():
-        raise RuntimeError("Apple MPS is unavailable.")
-    pipeline = SanaSprintPipeline.from_pretrained(model_path, torch_dtype=torch.bfloat16)
-    pipeline.to("mps")
-    with torch.inference_mode():
-        image = pipeline(prompt=prompt, width=width, height=height, num_inference_steps=2).images[0]
-fd = os.open(output_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-with os.fdopen(fd, "wb") as file:
-    image.save(file, format="PNG")
-'''
-            try:
-                result = _run_local_image_process(
-                    [_janus_python_executable(), "-c", image_script, provider,
-                     model.strip(), prompt, str(image_path), size,
-                     str(reference_path) if reference_path else ""],
-                    model=model.strip(),
-                    cancellation=cancellation,
-                )
-            except subprocess.TimeoutExpired as error:
-                raise RuntimeError("Local image generation exceeded 30 minutes.") from error
-            _check_cancellation(cancellation)
-            if result.returncode:
-                output = (result.stderr or result.stdout).strip()
-                raise RuntimeError(f"Local {provider} image generation failed: {output[-2000:]}")
-        elif provider == "local_janus":
-            python_executable = _janus_python_executable()
-            if model.strip().casefold() == "deepseek-community/janus-pro-1b":
-                image_script = r'''
-import os
-import sys
-import torch
-from PIL import Image, ImageOps
-from transformers import JanusForConditionalGeneration, JanusProcessor
-
-model_path, prompt, output_path, requested_size, quality = sys.argv[1:]
-device = "mps" if torch.backends.mps.is_available() else "cpu"
-dtype = torch.float16 if device == "mps" else torch.float32
-processor = JanusProcessor.from_pretrained(model_path)
-model = JanusForConditionalGeneration.from_pretrained(model_path, torch_dtype=dtype).to(device).eval()
-messages = [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
-formatted = processor.apply_chat_template(messages, add_generation_prompt=True)
-inputs = processor(text=formatted, generation_mode="image", return_tensors="pt").to(device)
-with torch.inference_mode():
-    tokens = model.generate(**inputs, generation_mode="image", do_sample=True, use_cache=True)
-    decoded = model.decode_image_tokens(tokens)
-image = processor.postprocess(list(decoded.float()), return_tensors="PIL.Image.Image")["pixel_values"][0]
-width, height = (int(value) for value in requested_size.split("x"))
-image = ImageOps.fit(image, (width, height), method=Image.Resampling.LANCZOS)
-fd = os.open(output_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-with os.fdopen(fd, "wb") as file:
-    image.save(file, format="PNG")
-'''
-            else:
-                image_script = _JANUS_PYTHON_COMPATIBILITY + r'''
-import sys
-import os
-import torch
-from PIL import Image, ImageOps
-from janus.models import MultiModalityCausalLM, VLChatProcessor
-
-model_path, prompt, output_path, requested_size, quality = sys.argv[1:]
-processor = VLChatProcessor.from_pretrained(model_path)
-tokenizer = processor.tokenizer
-
-class LoaJanusModel(MultiModalityCausalLM):
-    def __init__(self, config):
-        super().__init__(config)
-        if (
-            hasattr(self, "get_expanded_tied_weights_keys")
-            and not hasattr(self, "all_tied_weights_keys")
-        ):
-            self.post_init()
-
-device = (
-    "mps"
-    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
-    else "cpu"
-)
-dtype = torch.float16 if device == "mps" else torch.float32
-model = LoaJanusModel.from_pretrained(
-    model_path, trust_remote_code=True, torch_dtype=dtype
-)
-model = model.to(device=device, dtype=dtype).eval()
-conversation = [
-    {
-        "role": "<|User|>",
-        "content": f"Generate an image with {quality} visual quality: {prompt}",
-    },
-    {"role": "<|Assistant|>", "content": ""},
-]
-formatted = processor.apply_sft_template_for_multi_turn_prompts(
-    conversation,
-    sft_format=processor.sft_format,
-    system_prompt="",
-)
-input_ids = tokenizer.encode(formatted + processor.image_start_tag)
-input_tensor = torch.tensor([input_ids, input_ids], dtype=torch.long, device=device)
-input_tensor[1, 1:-1] = processor.pad_id
-with torch.inference_mode():
-    embeddings = model.language_model.get_input_embeddings()(input_tensor)
-    generated = torch.empty((1, 576), dtype=torch.int, device=device)
-    cache = None
-    for index in range(576):
-        result = model.language_model.model(
-            inputs_embeds=embeddings,
-            past_key_values=cache,
-            use_cache=True,
-        )
-        cache = result.past_key_values
-        scores = model.gen_head(result.last_hidden_state[:, -1, :]).float()
-        guided_scores = scores[1] + 5.0 * (scores[0] - scores[1])
-        token = torch.multinomial(torch.softmax(guided_scores, dim=-1), 1)
-        generated[0, index] = token[0]
-        embeddings = model.prepare_gen_img_embeds(token.repeat(2)).unsqueeze(1)
-    decoded = model.gen_vision_model.decode_code(
-        generated,
-        shape=[1, 8, 24, 24],
-    )
-pixels = (
-    ((decoded[0].permute(1, 2, 0).float().cpu() + 1) / 2)
-    .clamp(0, 1).numpy() * 255
-).astype("uint8")
-image = Image.fromarray(pixels)
-width, height = (int(value) for value in requested_size.split("x"))
-image = ImageOps.fit(
-    image,
-    (width, height),
-    method=Image.Resampling.LANCZOS,
-)
-file_descriptor = os.open(
-    output_path,
-    os.O_CREAT | os.O_EXCL | os.O_WRONLY,
-    0o600,
-)
-os.close(file_descriptor)
-image.save(output_path, format="PNG")
-'''
-            try:
-                result = _run_janus_process(
-                    [
-                        python_executable,
-                        "-c",
-                        image_script,
-                        model.strip(),
-                        prompt,
-                        str(image_path),
-                        size,
-                        quality,
-                    ],
-                    model=model.strip(),
-                    cancellation=cancellation,
-                )
-            except subprocess.TimeoutExpired as error:
-                raise RuntimeError(
-                    "Local Janus image generation exceeded 30 minutes."
-                ) from error
-            _check_cancellation(cancellation)
-            if result.returncode != 0:
-                output = (result.stderr or result.stdout).strip()
-                if "No module named" in output or "ModuleNotFoundError" in output:
-                    raise RuntimeError(
-                        "Janus dependencies are missing from LOA's Python "
-                        f"environment ({python_executable}). Set LOA_JANUS_PYTHON "
-                        "to the venv interpreter containing Janus, PyTorch, "
-                        "Transformers, and Pillow."
-                    )
-                raise RuntimeError(
-                    f"Local Janus image generation failed: {output[-2000:]}"
-                )
         else:
             api_key = _image_generation_api_key(settings, provider)
             image_mime_type = "image/png"
@@ -3283,7 +2985,6 @@ def _run_cancellable_process(
     arguments: list[str],
     cancellation: AgentCancellation | None = None,
     timeout: float = 30,
-    memory_guard: Callable[[], None] | None = None,
     process_memory_limit_bytes: int | None = None,
 ) -> subprocess.CompletedProcess[str]:
     if process_memory_limit_bytes is not None and process_memory_limit_bytes <= 0:
@@ -3322,17 +3023,6 @@ def _run_cancellable_process(
                 pass
             process.communicate()
             raise subprocess.TimeoutExpired(arguments, timeout)
-        if memory_guard is not None and time.monotonic() >= next_memory_check:
-            try:
-                memory_guard()
-            except RuntimeError:
-                try:
-                    os.killpg(process.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                process.communicate()
-                raise
-            next_memory_check = time.monotonic() + 1
         if (
             process_memory_limit_bytes is not None
             and time.monotonic() >= next_memory_check

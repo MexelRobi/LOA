@@ -181,7 +181,7 @@
         </section>
         <section class="settings-tab-panel extension-settings" data-settings-panel="image-gen" hidden>
           <h3>Image generation</h3>
-          <p>Janus is autoregressive. FLUX uses flow matching; Sana and Stable Diffusion use diffusion.</p>
+          <p>Image generation is available through Apple Stable Diffusion, OpenAI, or Google Gemini.</p>
           <label class="image-gen-enabled">
             <input id="image-gen-enabled" type="checkbox">
             Enable image generation
@@ -190,14 +190,11 @@
           <select id="image-gen-provider">
             <option value="openai">OpenAI (gpt-image-1)</option>
             <option value="gemini">Google Gemini</option>
-            <option value="local_janus">Local Janus-Pro</option>
-            <option value="local_flux">Local FLUX.2 Klein (MLX)</option>
-            <option value="local_sana">Local Sana Sprint (PyTorch/MPS)</option>
-            <option value="local_coreml_sd">Local Stable Diffusion 2.1 (Core ML, low memory)</option>
+            <option value="local_coreml_sd">Apple Stable Diffusion (local)</option>
           </select>
           <label for="image-gen-model">Model</label>
           <input id="image-gen-model" autocomplete="off">
-          <p>For local generation on a 16 GB Mac, use <code>deepseek-ai/Janus-Pro-1B</code>. Core ML Stable Diffusion runs on Apple Silicon with a 1.9 GiB process-RSS limit; it downloads about 4.3 GiB if not cached.</p>
+          <p>Apple Stable Diffusion runs on Apple Silicon with a 1.9 GiB process-RSS limit; it downloads about 4.3 GiB if not cached.</p>
           <label for="image-gen-api-key">API key</label>
           <input id="image-gen-api-key" type="password" autocomplete="new-password"
             placeholder="Optional; saved key stays hidden">
@@ -264,12 +261,13 @@
       <div id="skill-command-hints" class="skill-command-hints" aria-label="Skill command suggestions"></div>
       <div id="chat-controls" class="chat-controls">
         <button id="send-button" class="primary-button" type="submit" form="chat-form">Send</button>
-        <input id="reference-image" class="visually-hidden" type="file" accept="image/png,image/jpeg,image/webp" aria-label="Reference image for FLUX editing" disabled>
-        <label id="reference-image-label" class="reference-button reference-disabled" for="reference-image">
-          <svg aria-hidden="true" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="3"></rect><circle cx="8.5" cy="8.5" r="1.5"></circle><path d="m21 15-5-5L5 21"></path></svg>
-          <span id="reference-image-name">Add image</span>
-        </label>
-        <button id="reference-image-clear" class="reference-clear" type="button" aria-label="Remove reference image" hidden>×</button>
+        <input id="chat-files" class="visually-hidden" type="file" multiple aria-label="Files to attach">
+        <button id="add-file-button" class="file-button" type="button">
+          <svg aria-hidden="true" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"></path><path d="M13 2v7h7M12 12v6M9 15h6"></path></svg>
+          Add File
+        </button>
+        <span id="chat-file-names" class="chat-file-names" aria-live="polite"></span>
+        <button id="clear-chat-files" class="file-clear" type="button" aria-label="Remove selected files" hidden>×</button>
         <button id="break-loop-button" class="quiet-button" type="button"
           aria-hidden="true" disabled>Break Loop</button>
         <button id="home-toggle" class="quiet-button" type="button">Home</button>

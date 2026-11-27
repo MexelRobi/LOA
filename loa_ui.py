@@ -55,9 +55,6 @@ from loa_agent import (
 )
 from loa_config import (
     AssistantConfig,
-    DEFAULT_FLUX_MODEL,
-    DEFAULT_JANUS_MODEL,
-    DEFAULT_SANA_MODEL,
     DEFAULT_COREML_SD_MODEL,
     DEFAULT_OLLAMA_HOST,
     DEFAULT_PROMPT,
@@ -305,9 +302,8 @@ class SettingsScreen(Screen):
                                 if not isinstance(image_gen, dict):
                                     image_gen = {}
                                 yield Label(
-                                    "Janus is autoregressive; FLUX uses flow matching "
-                                    "and Sana uses diffusion. Core ML Stable Diffusion "
-                                    "uses Apple's on-device runtime."
+                                    "Generate images with Apple Stable Diffusion, OpenAI, "
+                                    "or Google Gemini."
                                 )
                                 yield Checkbox(
                                     "Enable image generation",
@@ -319,11 +315,8 @@ class SettingsScreen(Screen):
                                     [
                                         ("OpenAI (gpt-image-1)", "openai"),
                                         ("Google Gemini", "gemini"),
-                                        ("Local Janus-Pro", "local_janus"),
-                                        ("Local FLUX.2 Klein (MLX)", "local_flux"),
-                                        ("Local Sana Sprint (PyTorch/MPS)", "local_sana"),
                                         (
-                                            "Local Stable Diffusion 2.1 (Core ML, low memory)",
+                                            "Apple Stable Diffusion (local)",
                                             "local_coreml_sd",
                                         ),
                                     ],
@@ -336,8 +329,7 @@ class SettingsScreen(Screen):
                                     id="image_gen_model",
                                 )
                                 yield Label(
-                                    "On a 16 GB Mac use deepseek-ai/Janus-Pro-1B. "
-                                    "Core ML Stable Diffusion uses a 1.9 GiB process-RSS "
+                                    "Apple Stable Diffusion uses a 1.9 GiB process-RSS "
                                     "limit and downloads about 4.3 GiB if not cached."
                                 )
                                 yield Label("API key (blank keeps saved key):")
@@ -670,9 +662,6 @@ class SettingsScreen(Screen):
         default_models = {
             "openai": "gpt-image-1",
             "gemini": "gemini-2.5-flash-image",
-            "local_janus": DEFAULT_JANUS_MODEL,
-            "local_flux": DEFAULT_FLUX_MODEL,
-            "local_sana": DEFAULT_SANA_MODEL,
             "local_coreml_sd": DEFAULT_COREML_SD_MODEL,
         }
         current_model = self.query_one("#image_gen_model", Input).value.strip()

@@ -5,11 +5,11 @@ from __future__ import annotations
 import hmac
 import base64
 import binascii
-import io
 import ipaddress
 import json
 import getpass
 import logging
+import mimetypes
 import os
 import re
 import secrets
@@ -84,6 +84,7 @@ from loa_storage import (
     rename_chat_session,
     save_chat_session,
     save_config,
+    chat_attachments_directory_path,
     generated_images_directory_path,
 )
 from loa_mcp import mcp_manager
@@ -99,7 +100,8 @@ from loa_skills import (
 
 
 MAX_REQUEST_BYTES = 1_000_000
-MAX_IMAGE_UPLOAD_BYTES = 8_000_000
+MAX_ATTACHMENT_BYTES = 8_000_000
+MAX_CHAT_ATTACHMENTS = 12
 WEB_LOCK_TIMEOUT = 0.5
 WEB_RUNTIME_WAIT_TIMEOUT = 3.0
 WEB_SHUTDOWN_TIMEOUT = 0.25
@@ -158,12 +160,6 @@ def _required_string(payload: dict[str, Any], key: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{key.replace('_', ' ').capitalize()} is required.")
     return value.strip()
-
-
-def _require_reference_image_editing(config: AssistantConfig) -> None:
-    image_gen = config.get("image_gen", {})
-    if not image_gen.get("enabled", True) or image_gen.get("provider") != "local_flux":
-        raise ValueError("Reference image uploads require enabled image generation with the local FLUX provider.")
 
 
 def _optional_string(payload: dict[str, Any], key: str) -> str | None:
@@ -483,7 +479,7 @@ class LoaRequestHandler(BaseHTTPRequestHandler):
         try:
             path = urlsplit(self.path).path
             payload = self._read_json(
-                limit=12_000_000 if path == "/api/images/upload" else MAX_REQUEST_BYTES
+                limit=12_000_000 if path == "/api/files/upload" else MAX_REQUEST_BYTES
             )
             if path == "/auth/login":
                 self._login(payload)
@@ -526,8 +522,8 @@ class LoaRequestHandler(BaseHTTPRequestHandler):
                     self._handle_cronjobs(payload)
                 elif path == "/api/chat":
                     self._send_message(payload)
-                elif path == "/api/images/upload":
-                    self._upload_reference_image(payload)
+                elif path == "/api/files/upload":
+                    self._upload_chat_file(payload)
                 elif path == "/api/command":
                     self._handle_command(payload)
                 else:
@@ -631,41 +627,53 @@ class LoaRequestHandler(BaseHTTPRequestHandler):
             raise ValueError("A JSON object is required.")
         return payload
 
-    def _upload_reference_image(self, payload: dict[str, Any]) -> None:
-        _require_reference_image_editing(self.server.state.config)
-        from PIL import Image, ImageOps, UnidentifiedImageError
-
+    def _upload_chat_file(self, payload: dict[str, Any]) -> None:
+        filename = payload.get("filename")
+        if not isinstance(filename, str):
+            raise ValueError("A file name is required.")
+        filename = filename.replace("\\", "/").rsplit("/", 1)[-1].strip()
+        if (
+            not filename
+            or len(filename) > 255
+            or any(ord(character) < 32 or ord(character) == 127 for character in filename)
+        ):
+            raise ValueError("The file name is invalid.")
+        content_type = payload.get("content_type", "")
+        if (
+            not isinstance(content_type, str)
+            or len(content_type) > 255
+            or any(ord(character) < 32 or ord(character) == 127 for character in content_type)
+        ):
+            raise ValueError("The file content type is invalid.")
+        mime_type = (
+            mimetypes.guess_type(filename)[0] or content_type.strip().lower()
+        )
         encoded = payload.get("data")
         if not isinstance(encoded, str):
-            raise ValueError("An encoded reference image is required.")
+            raise ValueError("Encoded file data is required.")
         try:
             data = base64.b64decode(encoded, validate=True)
         except (ValueError, binascii.Error) as error:
-            raise ValueError("Invalid reference image data.") from error
-        if not data or len(data) > MAX_IMAGE_UPLOAD_BYTES:
-            raise ValueError("Reference image must be at most 8 MB.")
-        try:
-            with Image.open(io.BytesIO(data)) as image:
-                if image.format not in {"PNG", "JPEG", "WEBP"}:
-                    raise ValueError("Reference image must be PNG, JPEG, or WebP.")
-                if image.width * image.height > 16_000_000:
-                    raise ValueError("Reference image exceeds 16 megapixels.")
-                image.load()
-                converted = ImageOps.exif_transpose(image).convert("RGB")
-        except (UnidentifiedImageError, OSError, Image.DecompressionBombError) as error:
-            raise ValueError(f"Invalid reference image: {error}") from error
-        directory = generated_images_directory_path()
+            raise ValueError("Invalid file data.") from error
+        if not data or len(data) > MAX_ATTACHMENT_BYTES:
+            raise ValueError("Files must be non-empty and at most 8 MB.")
+        directory = chat_attachments_directory_path()
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-        filename = f"{uuid.uuid4().hex}.png"
-        path = directory / filename
+        directory.chmod(0o700)
+        attachment_id = uuid.uuid4().hex
+        path = directory / attachment_id
         fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         try:
             with os.fdopen(fd, "wb") as file:
-                converted.save(file, format="PNG")
+                file.write(data)
         except BaseException:
             path.unlink(missing_ok=True)
             raise
-        self._send_json({"filename": filename, "image_url": f"/api/images/{filename}"})
+        self._send_json({
+            "id": attachment_id,
+            "filename": filename,
+            "mime_type": mime_type,
+        })
 
     def _save_settings(self, payload: dict[str, Any]) -> None:
         state = self.server.state
@@ -1190,17 +1198,43 @@ class LoaRequestHandler(BaseHTTPRequestHandler):
             raise ValueError("Approve or cancel the pending action first.")
 
         text = text.strip()
-        reference = payload.get("image_filename")
-        if reference is not None:
-            _require_reference_image_editing(state.config)
+        user_text = text
+        requested_attachments = payload.get("attachments", [])
+        if not isinstance(requested_attachments, list) or len(requested_attachments) > MAX_CHAT_ATTACHMENTS:
+            raise ValueError(f"Attach no more than {MAX_CHAT_ATTACHMENTS} files per message.")
+        attachments = []
+        attachment_directory = chat_attachments_directory_path()
+        for item in requested_attachments:
+            if not isinstance(item, dict):
+                raise ValueError("Chat attachment metadata is invalid.")
+            attachment_id = item.get("id")
+            filename = item.get("filename")
+            mime_type = item.get("mime_type", "")
             if (
-                not isinstance(reference, str)
-                or re.fullmatch(r"[a-f0-9]{32}\.png", reference) is None
-                or not (generated_images_directory_path() / reference).is_file()
+                not isinstance(attachment_id, str)
+                or re.fullmatch(r"[a-f0-9]{32}", attachment_id) is None
+                or not isinstance(filename, str)
+                or not isinstance(mime_type, str)
             ):
-                raise ValueError("Invalid reference image.")
-            text += f"\n[Reference image for editing: {reference}]"
-        skill = resolve_skill_command(text, state.config.get("skill_states", {}))
+                raise ValueError("Chat attachment metadata is invalid.")
+            filename = filename.replace("\\", "/").rsplit("/", 1)[-1].strip()
+            if (
+                not filename
+                or len(filename) > 255
+                or any(ord(character) < 32 or ord(character) == 127 for character in filename)
+                or not (attachment_directory / attachment_id).is_file()
+            ):
+                raise ValueError("An attached file is invalid or no longer available.")
+            attachments.append({
+                "id": attachment_id,
+                "name": filename,
+                "mime_type": mime_type,
+            })
+        if attachments:
+            text += "\n\n[Attached files: " + ", ".join(
+                item["name"] for item in attachments
+            ) + "]"
+        skill = resolve_skill_command(user_text, state.config.get("skill_states", {}))
         if state.session is None:
             self._activate_chat(new_chat_session(), persist=False)
         if skill is not None:
@@ -1212,8 +1246,8 @@ class LoaRequestHandler(BaseHTTPRequestHandler):
                 state.config.get("skill_states", {}),
             )
         user_message = {"role": "user", "content": text}
-        if reference is not None:
-            user_message["ui"] = {"type": "reference_image", "filename": reference}
+        if attachments:
+            user_message["attachments"] = attachments
         state.messages.append(user_message)
         state.transcript.append({"role": "user", "content": text})
         _save_active_chat(state)
