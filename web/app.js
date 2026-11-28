@@ -16,6 +16,7 @@ const elements = {
   homePanel: document.querySelector("#home-panel"),
   homeNewChat: document.querySelector("#home-new-chat"),
   homeContinueChat: document.querySelector("#home-continue-chat"),
+  homeHiddenChats: document.querySelector("#home-hidden-chats"),
   homeSettings: document.querySelector("#home-settings"),
   homeLogout: document.querySelector("#home-logout"),
   homeRecentChats: document.querySelector("#home-recent-chats"),
@@ -39,6 +40,7 @@ const elements = {
   settingsClose: document.querySelector("#settings-close"),
   settingsPanel: document.querySelector("#settings-panel"),
   chatsPanel: document.querySelector("#chats-panel"),
+  chatsHeading: document.querySelector("#chats-heading"),
   chatsClose: document.querySelector("#chats-close"),
   savedChats: document.querySelector("#saved-chats"),
   chatTitle: document.querySelector("#chat-title"),
@@ -47,12 +49,20 @@ const elements = {
   chatOpen: document.querySelector("#chat-open"),
   chatNew: document.querySelector("#chat-new"),
   chatRename: document.querySelector("#chat-rename"),
+  chatHide: document.querySelector("#chat-hide"),
+  hiddenPinDialog: document.querySelector("#hidden-pin-dialog"),
+  hiddenPinForm: document.querySelector("#hidden-pin-form"),
+  hiddenPinHeading: document.querySelector("#hidden-pin-heading"),
+  hiddenPin: document.querySelector("#hidden-pin"),
+  hiddenPinConfirm: document.querySelector("#hidden-pin-confirm"),
+  hiddenPinConfirmGroup: document.querySelector("#hidden-pin-confirm-group"),
+  hiddenPinStatus: document.querySelector("#hidden-pin-status"),
+  hiddenPinCancel: document.querySelector("#hidden-pin-cancel"),
   chatDelete: document.querySelector("#chat-delete"),
   chatVectorize: document.querySelector("#chat-vectorize"),
   settingsHeading: document.querySelector("#settings-heading"),
   settingsForm: document.querySelector("#settings-form"),
   settingsStatus: document.querySelector("#settings-status"),
-  assistantName: document.querySelector("#assistant-name"),
   modelName: document.querySelector("#model-name"),
   ollamaHost: document.querySelector("#ollama-host"),
   imageGenEnabled: document.querySelector("#image-gen-enabled"),
@@ -68,7 +78,6 @@ const elements = {
   imageLightbox: document.querySelector("#image-lightbox"),
   imageLightboxImage: document.querySelector("#image-lightbox-image"),
   imageLightboxClose: document.querySelector("#image-lightbox-close"),
-  systemPrompt: document.querySelector("#system-prompt"),
   mcpServers: document.querySelector("#mcp-servers"),
   mcpControls: document.querySelector("#mcp-controls"),
   refreshMcpControls: document.querySelector("#refresh-mcp-controls"),
@@ -84,7 +93,6 @@ const elements = {
   newSkillContent: document.querySelector("#new-skill-content"),
   createSkill: document.querySelector("#create-skill"),
   reloadSkills: document.querySelector("#reload-skills"),
-  resetPrompt: document.querySelector("#reset-prompt"),
   resetHost: document.querySelector("#reset-host"),
   settingsTabs: document.querySelector(".settings-tabs"),
   profileName: document.querySelector("#about-name"),
@@ -125,12 +133,13 @@ const elements = {
 
 let configured = false;
 let chatBusy = false;
-let defaultPrompt = "";
 let defaultOllamaHost = "http://127.0.0.1:11434";
 let commandPending = false;
 let loopStopped = false;
 let activeChatId = null;
 let selectedChatId = null;
+let hiddenChatsMode = false;
+let pinConfigured = false;
 let renderedToolCount = 0;
 let imageProgressCard = null;
 let currentSkillStates = {};
@@ -671,9 +680,6 @@ function selectSettingsTab(name) {
 }
 
 function showSettings(config, isSetup, openPanel = true) {
-  if (typeof config.default_prompt === "string") {
-    defaultPrompt = config.default_prompt;
-  }
   if (typeof config.default_ollama_host === "string") {
     defaultOllamaHost = config.default_ollama_host;
   }
@@ -685,11 +691,9 @@ function showSettings(config, isSetup, openPanel = true) {
   }
   elements.settingsHeading.textContent = isSetup ? "Set up your assistant" : "Assistant settings";
   elements.settingsClose.hidden = isSetup;
-  elements.assistantName.value = config.name;
   elements.modelName.value = config.model;
   elements.ollamaHost.value = config.ollama_host || defaultOllamaHost;
   elements.ollamaHost.placeholder = defaultOllamaHost;
-  elements.systemPrompt.value = config.prompt;
   const imageGen = config.image_gen || {};
   elements.imageGenEnabled.checked = imageGen.enabled !== false;
   elements.imageGenProvider.value = imageGen.provider || "openai";
@@ -752,6 +756,7 @@ function relativeChatTime(timestamp) {
 
 async function refreshHomeChats() {
   const result = await api("/api/chats");
+  pinConfigured = result.pin_configured;
   savedChatEntries = result.chats || [];
   activeChatId = result.active_chat_id;
   elements.homeRecentChats.replaceChildren();
@@ -779,6 +784,15 @@ async function refreshHomeChats() {
 }
 
 async function showHome() {
+  if (hiddenChatsMode) {
+    try {
+      await api("/api/chats", { action: "home" });
+    } catch (error) {
+      setStatus(elements.connectionStatus, error.message);
+      return;
+    }
+  }
+  hiddenChatsMode = false;
   activeChatId = null;
   selectedChatId = null;
   commandPending = false;
@@ -1033,7 +1047,8 @@ async function loadAuthenticatedApplication() {
 }
 
 async function refreshChatList() {
-  const result = await api("/api/chats");
+  const result = await api(hiddenChatsMode ? "/api/chats?hidden=1" : "/api/chats");
+  pinConfigured = result.pin_configured;
   savedChatEntries = result.chats;
   activeChatId = result.active_chat_id;
   elements.savedChats.replaceChildren();
@@ -1062,9 +1077,47 @@ async function refreshChatList() {
   elements.chatTitle.value = selected?.title || "";
   elements.chatOpen.disabled = !selected;
   elements.chatRename.disabled = !selected;
+  elements.chatHide.disabled = !selected;
+  elements.chatHide.textContent = hiddenChatsMode ? "Unhide" : "Hide";
+  elements.chatsHeading.textContent = hiddenChatsMode ? "Hidden Chats" : "Chats";
+  elements.chatNew.hidden = hiddenChatsMode;
   elements.chatDelete.disabled = !selected;
   elements.chatVectorize.disabled = !selected;
   applyChatSearch();
+}
+
+function requestHiddenPin(setup) {
+  return new Promise((resolve) => {
+    elements.hiddenPinForm.reset();
+    elements.hiddenPinHeading.textContent = setup ? "Set up hidden chats PIN" : "Unlock hidden chats";
+    elements.hiddenPinConfirmGroup.hidden = !setup;
+    elements.hiddenPinConfirm.required = setup;
+    setStatus(elements.hiddenPinStatus, "");
+    const cancel = () => elements.hiddenPinDialog.close();
+    const close = () => {
+      elements.hiddenPinForm.removeEventListener("submit", submit);
+      elements.hiddenPinCancel.removeEventListener("click", cancel);
+      resolve(elements.hiddenPinDialog.returnValue === "ok");
+    };
+    const submit = async (event) => {
+      event.preventDefault();
+      try {
+        await api("/api/chats", setup
+          ? { action: "set_pin", pin: elements.hiddenPin.value, confirm_pin: elements.hiddenPinConfirm.value }
+          : { action: "unlock", pin: elements.hiddenPin.value });
+        pinConfigured = true;
+        elements.hiddenPinDialog.close("ok");
+      } catch (error) {
+        setStatus(elements.hiddenPinStatus, error.message);
+      }
+    };
+    elements.hiddenPinDialog.returnValue = "";
+    elements.hiddenPinForm.addEventListener("submit", submit);
+    elements.hiddenPinCancel.addEventListener("click", cancel);
+    elements.hiddenPinDialog.addEventListener("close", close, { once: true });
+    elements.hiddenPinDialog.showModal();
+    elements.hiddenPin.focus();
+  });
 }
 
 async function showChats() {
@@ -1197,6 +1250,18 @@ elements.homeSettings.addEventListener("click", async () => {
 
 elements.homeLogout.addEventListener("click", () => elements.logoutButton.click());
 
+elements.homeHiddenChats.addEventListener("click", async () => {
+  if (!pinConfigured) {
+    setStatus(elements.homeStatus, "Hide a chat first to set up a PIN.");
+    return;
+  }
+  if (await requestHiddenPin(false)) {
+    hiddenChatsMode = true;
+    selectedChatId = null;
+    await showChats();
+  }
+});
+
 elements.homeNewChat.addEventListener("click", async () => {
   try {
     showChatTranscript(await api("/api/chats", { action: "new" }));
@@ -1239,12 +1304,21 @@ elements.homeRecentChats.addEventListener("click", async (event) => {
 
 elements.chatsToggle.addEventListener("click", showChats);
 
-elements.chatsClose.addEventListener("click", () => {
+elements.chatsClose.addEventListener("click", async () => {
   elements.chatsPanel.hidden = true;
   if (activeChatId) {
     elements.chatPanel.hidden = false;
   } else {
-    void showHome();
+    if (hiddenChatsMode) {
+      try {
+        await api("/api/chats", { action: "home" });
+      } catch (error) {
+        setStatus(elements.chatsStatus, error.message);
+        elements.chatsPanel.hidden = false;
+        return;
+      }
+    }
+    await showHome();
   }
 });
 
@@ -1259,6 +1333,11 @@ elements.savedChats.addEventListener("click", (event) => {
   }
   const title = button.querySelector("strong");
   elements.chatTitle.value = title?.textContent || "";
+  elements.chatOpen.disabled = false;
+  elements.chatRename.disabled = false;
+  elements.chatHide.disabled = false;
+  elements.chatDelete.disabled = false;
+  elements.chatVectorize.disabled = false;
 });
 
 elements.chatSearch.addEventListener("input", applyChatSearch);
@@ -1301,6 +1380,23 @@ elements.chatRename.addEventListener("click", async () => {
     if (result.active_chat_id === selectedChatId) {
       activeChatId = result.active_chat_id;
     }
+  } catch (error) {
+    setStatus(elements.chatsStatus, error.message);
+  }
+});
+
+elements.chatHide.addEventListener("click", async () => {
+  if (!selectedChatId) return;
+  if (!hiddenChatsMode && !pinConfigured && !await requestHiddenPin(true)) return;
+  try {
+    const result = await api("/api/chats", {
+      action: hiddenChatsMode ? "unhide" : "hide",
+      chat_id: selectedChatId,
+    });
+    activeChatId = result.active_chat_id;
+    selectedChatId = null;
+    await refreshChatList();
+    setStatus(elements.chatsStatus, hiddenChatsMode ? "Chat unhidden." : "Chat hidden.");
   } catch (error) {
     setStatus(elements.chatsStatus, error.message);
   }
@@ -1551,11 +1647,6 @@ elements.cronjobsList.addEventListener("click", async (event) => {
   }
 });
 
-elements.resetPrompt.addEventListener("click", () => {
-  elements.systemPrompt.value = defaultPrompt;
-  setStatus(elements.settingsStatus, "Default prompt restored. Save settings to keep it.");
-});
-
 elements.resetHost.addEventListener("click", () => {
   elements.ollamaHost.value = defaultOllamaHost;
   setStatus(elements.settingsStatus, "Default host restored. Save settings to keep it.");
@@ -1639,9 +1730,7 @@ elements.settingsForm.addEventListener("submit", async (event) => {
       skillStates[toggle.dataset.skillName] = toggle.checked;
     }
     const config = await api("/api/settings", {
-      name: elements.assistantName.value,
       model: elements.modelName.value,
-      prompt: elements.systemPrompt.value,
       ollama_host: elements.ollamaHost.value,
       image_gen: imageGenSettingsPayload(),
       mcp_servers: mcpServers,

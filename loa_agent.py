@@ -1062,7 +1062,6 @@ def _request_assistant_message(
     system_message = {
         "role": "system",
         "content": build_system_prompt(
-            config["prompt"],
             active_chat_id,
             config.get("skill_states", {}),
         ),
@@ -2942,7 +2941,6 @@ def run_scheduled_prompt(config: AssistantConfig, job: dict[str, Any]) -> str:
         {
             "role": "system",
             "content": build_system_prompt(
-                config["prompt"],
                 skill_states=config.get("skill_states", {}),
             ),
         },

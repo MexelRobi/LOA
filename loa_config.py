@@ -79,14 +79,7 @@ CONTEXT_AWARENESS_DIRECTIVE = (
 )
 
 
-def ensure_security_directive(prompt: str) -> str:
-    """Keep the mandatory tool-output security rule in saved user prompts."""
-    if SECURITY_DIRECTIVE in prompt:
-        return prompt
-    return f"{prompt.rstrip()}\n\n{SECURITY_DIRECTIVE}"
-
-
-DEFAULT_PROMPT = """You are LOA, a versatile, natural, and helpful personal assistant. Always reply in the same language as the user's message.
+DEFAULT_PROMPT = """You are LOA, a versatile, natural, and helpful personal assistant created by MexelRobi. Always reply in the same language as the user's message.
 
 You can chat freely about any topic, brainstorm ideas, explain concepts in detail, or help with everyday tasks. Match the tone and depth of your answer to what the user needs—be conversational when chatting, and thorough when explaining.
 
@@ -127,15 +120,14 @@ def default_ollama_host() -> str:
 
 
 def build_system_prompt(
-    base_prompt: str,
     active_chat_id: str | None = None,
     skill_states: dict[str, bool] | None = None,
 ) -> str:
-    """Append the current runtime's operating-system context to the saved prompt."""
+    """Append the current runtime context to LOA's fixed base prompt."""
     from loa_storage import build_chat_catalog
 
     prompt = (
-        f"{base_prompt.rstrip()}\n\n{NATURAL_BEHAVIOR_DIRECTIVE}\n\n"
+        f"{DEFAULT_PROMPT.rstrip()}\n\n{NATURAL_BEHAVIOR_DIRECTIVE}\n\n"
         f"{CONTEXT_AWARENESS_DIRECTIVE}\n\n"
         "Current runtime environment:\n"
         f"- Operating system: {platform.system()}\n"

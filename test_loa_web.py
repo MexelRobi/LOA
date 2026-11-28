@@ -21,6 +21,33 @@ import loa_web
 import loa_storage
 
 
+class WebIconTests(unittest.TestCase):
+    def test_icon_assets_are_served_without_authentication(self):
+        state = loa_web.WebChatState(loa_web.default_config())
+        server = loa_web.LoaHTTPServer(("127.0.0.1", 0), loa_web.LoaRequestHandler, state)
+        thread = threading.Thread(target=server.serve_forever)
+        thread.start()
+        connection = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=5)
+        try:
+            for name, content_type in (
+                ("favicon.ico", "image/x-icon"),
+                ("apple-touch-icon.png", "image/png"),
+            ):
+                with self.subTest(name=name):
+                    connection.request("GET", f"/{name}")
+                    response = connection.getresponse()
+                    self.assertEqual(response.status, 200)
+                    self.assertEqual(response.getheader("Content-Type"), content_type)
+                    self.assertEqual(
+                        response.read(), (loa_web.web_asset_directory() / name).read_bytes()
+                    )
+        finally:
+            connection.close()
+            server.shutdown()
+            thread.join()
+            server.server_close()
+
+
 class ChatFileUploadTests(unittest.TestCase):
     def test_upload_preserves_general_file_bytes_and_private_permissions(self):
         data = b"print('hello')\n"
@@ -592,6 +619,29 @@ class WebStartupTests(unittest.TestCase):
 
 
 class WebSettingsTests(unittest.TestCase):
+    def test_existing_custom_identity_is_migrated_without_changing_other_settings(self):
+        config = loa_web.default_config()
+        config.update(name="Old assistant", prompt="Old prompt", model="custom-model")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            path.write_text(json.dumps(config))
+            with (
+                patch.object(loa_storage, "config_file_path", return_value=path),
+                patch.object(loa_storage, "ensure_skills_directory"),
+            ):
+                loaded = loa_storage.load_config()
+                saved = json.loads(path.read_text())
+                self.assertEqual(loaded["name"], loa_web.DEFAULT_NAME)
+                self.assertEqual(loaded["prompt"], loa_web.DEFAULT_PROMPT)
+                self.assertEqual(loaded["model"], "custom-model")
+                self.assertEqual(saved, loaded)
+                config["name"] = "Changed again"
+                config["prompt"] = "Changed again"
+                loa_storage.save_config(config)
+                saved = json.loads(path.read_text())
+                self.assertEqual(saved["name"], loa_web.DEFAULT_NAME)
+                self.assertEqual(saved["prompt"], loa_web.DEFAULT_PROMPT)
+
     def test_saving_reuses_unchanged_mcp_connections_and_reloads_changes(self):
         for changed in (False, True):
             with self.subTest(mcp_changed=changed):
@@ -620,7 +670,8 @@ class WebSettingsTests(unittest.TestCase):
     def test_settings_are_persisted_without_reconnecting_mcp(self):
         state = loa_web.WebChatState(loa_web.default_config())
         payload = deepcopy(state.config)
-        payload["name"] = "Updated assistant"
+        payload.pop("name")
+        payload.pop("prompt")
         payload["image_gen"]["model"] = "test-image-model"
         handler = object.__new__(loa_web.LoaRequestHandler)
         handler.server = SimpleNamespace(state=state)
@@ -635,5 +686,18 @@ class WebSettingsTests(unittest.TestCase):
             ):
                 handler._save_settings(payload)
             saved = json.loads(path.read_text())
-        self.assertEqual(saved["name"], "Updated assistant")
+        self.assertEqual(saved["name"], loa_web.DEFAULT_NAME)
+        self.assertEqual(saved["prompt"], loa_web.DEFAULT_PROMPT)
         self.assertEqual(saved["image_gen"]["model"], "test-image-model")
+
+    def test_settings_reject_changes_to_fixed_identity(self):
+        state = loa_web.WebChatState(loa_web.default_config())
+        handler = object.__new__(loa_web.LoaRequestHandler)
+        handler.server = SimpleNamespace(state=state)
+        for field in ("name", "prompt"):
+            with self.subTest(field=field):
+                payload = {"model": "another-model", field: "custom"}
+                with self.assertRaisesRegex(ValueError, "cannot be changed"):
+                    handler._save_settings(payload)
+        self.assertEqual(state.config["name"], loa_web.DEFAULT_NAME)
+        self.assertEqual(state.config["prompt"], loa_web.DEFAULT_PROMPT)

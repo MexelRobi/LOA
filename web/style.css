@@ -913,11 +913,6 @@ textarea {
   gap: 5px;
 }
 
-.settings-panel label[for="system-prompt"] {
-  align-self: start;
-  padding-top: 7px;
-}
-
 .settings-panel .primary-button,
 .settings-panel .status {
   grid-column: 2;
@@ -1169,7 +1164,6 @@ textarea {
 
   .settings-panel textarea,
   .settings-panel .host-actions,
-  .settings-panel label[for="system-prompt"],
   .settings-panel .prompt-actions,
   .settings-panel .primary-button,
   .settings-panel .status {

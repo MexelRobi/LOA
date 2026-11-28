@@ -88,9 +88,13 @@ group=$$
 watchdog=$!
 "$@"
 status=$?
-kill "$watchdog" 2>/dev/null
-wait "$watchdog" 2>/dev/null
-/bin/rm -f -- "$marker"
+if [ -s "$marker" ]; then
+    wait "$watchdog"
+else
+    kill "$watchdog" 2>/dev/null
+    wait "$watchdog" 2>/dev/null
+    /bin/rm -f -- "$marker"
+fi
 exit "$status"
 """
 
@@ -175,11 +179,14 @@ class MCPManager:
     def __init__(self) -> None:
         self._lock = threading.RLock()
         self._close_lock = threading.Lock()
+        self._reload_lock = threading.Lock()
         self._loop: asyncio.AbstractEventLoop | None = None
         self._loop_thread: threading.Thread | None = None
         self._shutdown_incomplete = False
         self._shutdown_requested = False
         self._stop_markers: set[str] = set()
+        self._requested_stop_markers: set[str] = set()
+        self._active_process_markers: set[str] = set()
         self._tasks: dict[str, concurrent.futures.Future[None]] = {}
         self._connections: dict[str, ClientSession] = {}
         self._schemas: list[dict[str, Any]] = []
@@ -203,6 +210,10 @@ class MCPManager:
 
     def reload(self, servers: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Disconnect old servers and reconnect enabled server configurations."""
+        with self._reload_lock:
+            return self._reload(servers)
+
+    def _reload(self, servers: list[dict[str, Any]]) -> list[dict[str, Any]]:
         signature = json.dumps(servers, sort_keys=True, ensure_ascii=False)
         with self._lock:
             if self._shutdown_requested:
@@ -210,6 +221,8 @@ class MCPManager:
             self._generation += 1
             generation = self._generation
             old_tasks = list(self._tasks.values())
+            stop_markers = tuple(self._stop_markers)
+            self._requested_stop_markers.update(stop_markers)
             self._tasks.clear()
             self._connections.clear()
             self._schemas.clear()
@@ -225,13 +238,44 @@ class MCPManager:
                 for server in servers
             }
 
+        failed_markers = self._signal_process_shutdown(stop_markers)
+        if failed_markers:
+            with self._lock:
+                self._requested_stop_markers.difference_update(failed_markers)
+
         for task in old_tasks:
             task.cancel()
+        shutdown_error: Exception | None = None
         for task in old_tasks:
             try:
                 task.result(timeout=5)
             except (concurrent.futures.CancelledError, concurrent.futures.TimeoutError):
-                pass
+                if not task.cancelled() and not task.done():
+                    shutdown_error = RuntimeError(
+                        "An MCP server task did not stop before reload."
+                    )
+                    break
+            except Exception as error:
+                shutdown_error = error
+                break
+
+        if shutdown_error is None:
+            deadline = time.monotonic() + _MCP_SHUTDOWN_TIMEOUT
+            while any(Path(marker).exists() for marker in stop_markers):
+                if time.monotonic() >= deadline:
+                    shutdown_error = RuntimeError(
+                        "An MCP server process group did not stop before reload."
+                    )
+                    break
+                time.sleep(0.05)
+
+        if failed_markers:
+            shutdown_error = RuntimeError(
+                "Could not signal an MCP server process group to stop."
+            )
+        if shutdown_error is not None:
+            logging.getLogger(__name__).error("MCP reload aborted: %s", shutdown_error)
+            raise shutdown_error
 
         if any(server["enabled"] for server in servers):
             self._ensure_loop()
@@ -355,13 +399,9 @@ class MCPManager:
                 markers = tuple(self._stop_markers)
             else:
                 markers = ()
-        for marker in markers:
-            try:
-                Path(marker).write_text("stop", encoding="ascii")
-            except OSError as error:
-                logging.getLogger(__name__).warning(
-                    "Could not signal MCP process shutdown: %s", error
-                )
+        with self._lock:
+            self._requested_stop_markers.update(markers)
+        self._signal_process_shutdown(markers)
         if not self._close_lock.acquire(timeout=min(timeout, 1)):
             logging.getLogger(__name__).warning("MCP shutdown is already in progress.")
             return
@@ -447,6 +487,19 @@ class MCPManager:
             thread.start()
 
     @staticmethod
+    def _signal_process_shutdown(markers: tuple[str, ...]) -> list[str]:
+        failed: list[str] = []
+        for marker in markers:
+            try:
+                Path(marker).write_text("stop", encoding="ascii")
+            except OSError as error:
+                failed.append(marker)
+                logging.getLogger(__name__).warning(
+                    "Could not signal MCP process shutdown: %s", error
+                )
+        return failed
+
+    @staticmethod
     def _run_loop(loop: asyncio.AbstractEventLoop) -> None:
         asyncio.set_event_loop(loop)
         loop.run_forever()
@@ -458,6 +511,10 @@ class MCPManager:
         ready: threading.Event,
     ) -> None:
         name = server["name"]
+        with self._lock:
+            if generation != self._generation or self._shutdown_requested:
+                ready.set()
+                return
         env = {
             **os.environ,
             **{key: value for key, value in server["env"].items() if value},
@@ -477,9 +534,10 @@ class MCPManager:
                 descriptor, marker = tempfile.mkstemp(prefix="loa-mcp-")
                 os.close(descriptor)
                 with self._lock:
-                    if self._shutdown_requested:
+                    if generation != self._generation or self._shutdown_requested:
                         Path(marker).unlink(missing_ok=True)
-                        raise RuntimeError("The MCP manager is shutting down.")
+                        ready.set()
+                        return
                     self._stop_markers.add(marker)
                 args = [
                     "-c", _MCP_PARENT_WATCHDOG, "loa-mcp", str(os.getpid()),
@@ -493,6 +551,9 @@ class MCPManager:
                 cwd=working_directory,
             )
             async with stdio_client(parameters) as (read_stream, write_stream):
+                if marker is not None:
+                    with self._lock:
+                        self._active_process_markers.add(marker)
                 async with ClientSession(read_stream, write_stream) as session:
                     await session.initialize()
                     response = await session.list_tools()
@@ -544,7 +605,11 @@ class MCPManager:
             with self._lock:
                 if marker is not None:
                     self._stop_markers.discard(marker)
-                    if not self._shutdown_requested:
+                    requested_stop = marker in self._requested_stop_markers
+                    active_process = marker in self._active_process_markers
+                    self._requested_stop_markers.discard(marker)
+                    self._active_process_markers.discard(marker)
+                    if not requested_stop or not active_process:
                         Path(marker).unlink(missing_ok=True)
                 if generation == self._generation:
                     was_connected = (

@@ -150,8 +150,10 @@ class RuntimeContextTests(unittest.TestCase):
                 ]),
                 patch("loa_skills.enabled_markdown_skill_instructions", return_value="Use concise language."),
             ):
-                prompt = loa_config.build_system_prompt("Base prompt")
+                prompt = loa_config.build_system_prompt()
 
+        self.assertTrue(prompt.startswith(loa_config.DEFAULT_PROMPT))
+        self.assertIn("created by MexelRobi", prompt)
         for tool_name in (
             "propose_shell_command",
             "web_search",

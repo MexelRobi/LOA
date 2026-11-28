@@ -1,9 +1,12 @@
 import asyncio
+import os
 import select
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
+import time
 import unittest
 from unittest.mock import patch
 
@@ -84,6 +87,83 @@ for line in sys.stdin:
             )
         finally:
             manager.close()
+
+    def test_reload_stops_descendant_processes_before_reconnecting(self):
+        if sys.platform == "win32":
+            self.skipTest("MCP process-group watchdog is POSIX-specific.")
+        with tempfile.TemporaryDirectory() as directory:
+            pid_path = os.path.join(directory, "child.pid")
+            script = """
+import json
+import signal
+import subprocess
+import sys
+import time
+child = subprocess.Popen(
+    [
+        sys.executable, "-c",
+        "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+        "time.sleep(60)",
+    ],
+    stdin=subprocess.DEVNULL,
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+)
+with open(sys.argv[1], "w", encoding="ascii") as pid_file:
+    pid_file.write(str(child.pid))
+for line in sys.stdin:
+    request = json.loads(line)
+    if "id" not in request:
+        continue
+    if request["method"] == "initialize":
+        result = {
+            "protocolVersion": request["params"]["protocolVersion"],
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "test", "version": "1"},
+        }
+    elif request["method"] == "tools/list":
+        result = {"tools": []}
+    else:
+        raise RuntimeError(request["method"])
+    print(json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": result}), flush=True)
+"""
+            manager = MCPManager()
+            server = {
+                "name": "test",
+                "enabled": True,
+                "command": sys.executable,
+                "args": ["-u", "-c", script, pid_path],
+                "env": {},
+            }
+            child_pid: int | None = None
+            try:
+                statuses = manager.reload([server])
+                self.assertEqual(statuses[0]["status"], "Connected", statuses)
+                deadline = time.monotonic() + 2
+                while not os.path.exists(pid_path) and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue(os.path.exists(pid_path), "MCP child did not start.")
+                with open(pid_path, encoding="ascii") as pid_file:
+                    child_pid = int(pid_file.read())
+
+                manager.reload([])
+
+                deadline = time.monotonic() + 3
+                while time.monotonic() < deadline:
+                    try:
+                        os.kill(child_pid, 0)
+                    except ProcessLookupError:
+                        break
+                    time.sleep(0.05)
+                else:
+                    self.fail(f"MCP descendant process {child_pid} survived reload.")
+            finally:
+                manager.close(permanent=True)
+                if child_pid is not None:
+                    try:
+                        os.kill(child_pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
 
     def test_single_interrupt_stops_process_with_pending_mcp_task(self):
         script = """

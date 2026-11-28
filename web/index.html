@@ -5,13 +5,15 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="color-scheme" content="dark">
   <title>LOA</title>
+  <link rel="icon" href="/favicon.ico" sizes="any">
+  <link rel="apple-touch-icon" href="/apple-touch-icon.png">
   <link rel="stylesheet" href="/style.css">
   <script src="/app.js" defer></script>
 </head>
 <body>
   <main class="app-shell">
     <header class="topbar">
-      <h1 id="app-title">LoaApp</h1>
+      <h1 id="app-title">LOA</h1>
     </header>
 
     <section id="home-panel" class="home-panel" hidden>
@@ -25,6 +27,7 @@
             Continue Last Chat
           </button>
           <button id="home-settings" class="quiet-button" type="button">Settings</button>
+          <button id="home-hidden-chats" class="quiet-button" type="button">Hidden Chats</button>
           <button id="home-logout" class="quiet-button" type="button">Exit</button>
         </div>
         <h3>Recent chats</h3>
@@ -65,8 +68,7 @@
           <button type="button" class="settings-tab" data-tab="image-gen">Image Gen</button>
         </nav>
         <div class="settings-tab-panel" data-settings-panel="general">
-          <label for="assistant-name">Assistant name</label>
-          <input id="assistant-name" name="name" autocomplete="off" required>
+          <p>Assistant: LOA</p>
           <label for="model-name">Ollama model</label>
           <input id="model-name" name="model" autocomplete="off" required>
           <label for="ollama-host">Ollama Host URL</label>
@@ -75,10 +77,7 @@
               placeholder="http://127.0.0.1:11434" autocomplete="url" required>
             <button id="reset-host" class="quiet-button" type="button">Reset Host</button>
           </div>
-          <label for="system-prompt">System prompt</label>
-          <textarea id="system-prompt" name="prompt" rows="7" required></textarea>
           <div class="prompt-actions">
-            <button id="reset-prompt" class="quiet-button" type="button">Reset Prompt</button>
             <button class="primary-button" type="submit">Save settings</button>
           </div>
         </div>
@@ -232,7 +231,7 @@
       <div class="section-heading">
         <div>
           <p class="eyebrow">CONVERSATIONS</p>
-          <h2>Chats</h2>
+          <h2 id="chats-heading">Chats</h2>
         </div>
         <button id="chats-close" class="quiet-button" type="button">Close</button>
       </div>
@@ -245,6 +244,7 @@
         <button id="chat-open" class="primary-button" type="button">Open / Switch</button>
         <button id="chat-new" class="quiet-button" type="button">New Chat</button>
         <button id="chat-rename" class="quiet-button" type="button">Rename</button>
+        <button id="chat-hide" class="quiet-button" type="button">Hide</button>
         <button id="chat-vectorize" class="quiet-button" type="button">Vectorize and delete</button>
         <button id="chat-delete" class="quiet-button" type="button">Delete</button>
       </div>
@@ -282,6 +282,24 @@
       <p id="connection-status" class="status" aria-live="polite"></p>
     </section>
   </main>
+  <dialog id="hidden-pin-dialog" aria-labelledby="hidden-pin-heading">
+    <form id="hidden-pin-form">
+      <h2 id="hidden-pin-heading">Unlock hidden chats</h2>
+      <label for="hidden-pin">PIN (4-12 digits)</label>
+      <input id="hidden-pin" type="password" inputmode="numeric" pattern="[0-9]{4,12}"
+        autocomplete="off" required>
+      <div id="hidden-pin-confirm-group" hidden>
+        <label for="hidden-pin-confirm">Confirm PIN</label>
+        <input id="hidden-pin-confirm" type="password" inputmode="numeric" pattern="[0-9]{4,12}"
+          autocomplete="off">
+      </div>
+      <p id="hidden-pin-status" class="status" aria-live="polite"></p>
+      <div class="chat-manager-actions">
+        <button type="submit" class="primary-button">Continue</button>
+        <button type="button" id="hidden-pin-cancel" class="quiet-button">Cancel</button>
+      </div>
+    </form>
+  </dialog>
   <dialog id="image-lightbox" class="image-lightbox" aria-label="Generated image preview">
     <button id="image-lightbox-close" class="quiet-button" type="button">Close</button>
     <img id="image-lightbox-image" alt="Generated image preview">

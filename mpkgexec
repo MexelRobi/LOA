@@ -4,9 +4,51 @@ set -euo pipefail
 REPO="MexelRobi/LOA"
 DEST="/usr/local/bin/loa"
 API="https://api.github.com/repos/${REPO}/releases/latest"
+LAUNCHCTL="/bin/launchctl"
+SERVICE_LABEL="com.loa.web"
+SERVICE_USER=$(id -un)
+SERVICE_UID=$(id -u)
+SERVICE_HOME=$HOME
+
+if [ "$SERVICE_UID" = "0" ]; then
+    SERVICE_USER=${SUDO_USER:-$(stat -f %Su /dev/console)}
+    if [ "$SERVICE_USER" = "root" ] || [ "$SERVICE_USER" = "loginwindow" ]; then
+        echo "[ERROR] Cannot determine the logged-in user for the LaunchAgent." >&2
+        exit 1
+    fi
+    SERVICE_UID=$(id -u "$SERVICE_USER")
+    SERVICE_HOME=$(dscl . -read "/Users/$SERVICE_USER" NFSHomeDirectory)
+    SERVICE_HOME=${SERVICE_HOME#NFSHomeDirectory: }
+fi
+
+SERVICE_DOMAIN="gui/$SERVICE_UID"
+SERVICE_TARGET="$SERVICE_DOMAIN/$SERVICE_LABEL"
+SERVICE_PLIST="$SERVICE_HOME/Library/LaunchAgents/$SERVICE_LABEL.plist"
+RESTART_SERVICE=0
+
+launchctl_for_user() {
+    if [ "$(id -u)" = "0" ]; then
+        "$LAUNCHCTL" asuser "$SERVICE_UID" sudo -u "$SERVICE_USER" "$LAUNCHCTL" "$@"
+    else
+        "$LAUNCHCTL" "$@"
+    fi
+}
 
 TMP=$(mktemp)
-trap 'rm -f "$TMP"' EXIT
+
+cleanup() {
+    status=$?
+    if [ "$RESTART_SERVICE" = "1" ]; then
+        echo "-> Restoring the previously running LOA LaunchAgent..."
+        if ! launchctl_for_user bootstrap "$SERVICE_DOMAIN" "$SERVICE_PLIST"; then
+            echo "[ERROR] Could not restore the LOA LaunchAgent. Run launchctl bootstrap $SERVICE_DOMAIN \"$SERVICE_PLIST\" as $SERVICE_USER." >&2
+            status=1
+        fi
+    fi
+    rm -f "$TMP"
+    exit "$status"
+}
+trap cleanup EXIT
 
 echo "-> Fetching latest LOA release..."
 
@@ -42,9 +84,54 @@ fi
 
 echo "-> Installing LOA..."
 
-sudo install -m 0755 "$TMP" "$DEST"
+SERVICE_INSTALLED=0
+if [ -f "$SERVICE_PLIST" ]; then
+    SERVICE_INSTALLED=1
+fi
+if launchctl_for_user print "$SERVICE_TARGET" >/dev/null 2>&1; then
+    if [ "$SERVICE_INSTALLED" = "0" ]; then
+        echo "[ERROR] The LOA LaunchAgent is loaded but its plist is missing: $SERVICE_PLIST" >&2
+        exit 1
+    fi
+    echo "-> Stopping the existing LOA LaunchAgent..."
+    if ! launchctl_for_user bootout "$SERVICE_TARGET"; then
+        echo "[ERROR] Could not stop the existing LOA LaunchAgent." >&2
+        exit 1
+    fi
+    RESTART_SERVICE=1
+elif [ "$SERVICE_INSTALLED" = "1" ]; then
+    if ! launchctl_for_user print "$SERVICE_DOMAIN" >/dev/null; then
+        echo "[ERROR] Cannot access the LaunchAgent domain $SERVICE_DOMAIN." >&2
+        exit 1
+    fi
+fi
+
+if [ "$(id -u)" = "0" ]; then
+    if ! install -m 0755 "$TMP" "$DEST"; then
+        echo "[ERROR] Could not install LOA at $DEST." >&2
+        exit 1
+    fi
+else
+    if ! sudo install -m 0755 "$TMP" "$DEST"; then
+        echo "[ERROR] Could not install LOA at $DEST." >&2
+        exit 1
+    fi
+fi
 
 xattr -d com.apple.quarantine "$DEST" 2>/dev/null || true
+
+if [ "$SERVICE_INSTALLED" = "1" ]; then
+    echo "-> Starting the existing LOA LaunchAgent..."
+    if ! launchctl_for_user bootstrap "$SERVICE_DOMAIN" "$SERVICE_PLIST"; then
+        echo "[ERROR] Could not register the existing LOA LaunchAgent." >&2
+        exit 1
+    fi
+    RESTART_SERVICE=0
+    if ! launchctl_for_user kickstart -k "$SERVICE_TARGET"; then
+        echo "[ERROR] Could not start the existing LOA LaunchAgent." >&2
+        exit 1
+    fi
+fi
 
 echo ""
 echo "LOA installed successfully at $DEST"

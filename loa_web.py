@@ -70,6 +70,7 @@ from loa_cron import (
 from loa_config import (
     AssistantConfig,
     build_system_prompt,
+    DEFAULT_NAME,
     DEFAULT_OLLAMA_HOST,
     DEFAULT_PROMPT,
     default_config,
@@ -86,6 +87,9 @@ from loa_storage import (
     save_config,
     chat_attachments_directory_path,
     generated_images_directory_path,
+    has_hidden_chat_pin,
+    set_hidden_chat_pin,
+    verify_hidden_chat_pin,
 )
 from loa_mcp import mcp_manager
 from loa_skills import (
@@ -203,7 +207,7 @@ class WebChatState:
     """Shared settings and conversation state for the single-user web server."""
 
     def __init__(self, config: AssistantConfig | None) -> None:
-        self.config = config or default_config()
+        self.config = {**(config or default_config()), "name": DEFAULT_NAME, "prompt": DEFAULT_PROMPT}
         self.configured = config is not None
         self.mcp_status: list[dict[str, Any]] = []
         self._runtime_ready = threading.Event()
@@ -219,6 +223,8 @@ class WebChatState:
         self.active_cancellation: AgentCancellation | None = None
         self.sessions: dict[str, float] = {}
         self.failed_logins: dict[str, list[float]] = {}
+        self.hidden_sessions: set[str] = set()
+        self.failed_pins: dict[str, list[float]] = {}
         self.session: ChatSession | None = None
         self.messages: list[dict[str, Any]] = []
         self.transcript: list[dict[str, Any]] = []
@@ -342,6 +348,8 @@ class LoaRequestHandler(BaseHTTPRequestHandler):
             "/": ("index.html", "text/html; charset=utf-8"),
             "/app.js": ("app.js", "text/javascript; charset=utf-8"),
             "/style.css": ("style.css", "text/css; charset=utf-8"),
+            "/favicon.ico": ("favicon.ico", "image/x-icon"),
+            "/apple-touch-icon.png": ("apple-touch-icon.png", "image/png"),
         }
         if path in asset_types:
             name, content_type = asset_types[path]
@@ -368,6 +376,9 @@ class LoaRequestHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/image-progress":
+            if self._hidden_active_locked():
+                self._send_json({"error": "Unlock hidden chats first."}, status=403)
+                return
             self._send_json(self.server.state.get_image_progress())
             return
 
@@ -397,11 +408,17 @@ class LoaRequestHandler(BaseHTTPRequestHandler):
 
         with self.server.state.request_lock():
             if path == "/api/chats":
+                hidden = parse_qs(urlsplit(self.path).query).get("hidden") == ["1"]
+                if hidden and not self._hidden_unlocked():
+                    self._send_json({"error": "Unlock hidden chats first."}, status=403)
+                    return
                 self._send_json(
                     {
+                        "pin_configured": has_hidden_chat_pin(),
                         "active_chat_id": (
                             self.server.state.session["id"]
                             if self.server.state.session
+                            and (not self.server.state.session["hidden"] or self._hidden_unlocked())
                             else None
                         ),
                         "chats": [
@@ -417,7 +434,7 @@ class LoaRequestHandler(BaseHTTPRequestHandler):
                                     and str(message.get("content") or "").strip()
                                 ),
                             }
-                            for chat in list_chat_sessions()
+                            for chat in list_chat_sessions(hidden=hidden)
                         ],
                     }
                 )
@@ -443,6 +460,11 @@ class LoaRequestHandler(BaseHTTPRequestHandler):
                     }
                 )
             elif path == "/api/history":
+                if self._hidden_active_locked():
+                    self._send_json({"transcript": [], "active_chat_id": None,
+                                     "pending_action": None, "pending_command": None,
+                                     "command_reason": None})
+                    return
                 self._send_json(
                     {
                         "transcript": self.server.state.transcript,
@@ -488,6 +510,9 @@ class LoaRequestHandler(BaseHTTPRequestHandler):
                 if not self._authorized():
                     self._send_json({"error": "Unauthorized"}, status=401)
                     return
+                if self._hidden_active_locked():
+                    self._send_json({"error": "Unlock hidden chats first."}, status=403)
+                    return
                 self._break_loop()
                 return
             if not self._authorized():
@@ -504,6 +529,10 @@ class LoaRequestHandler(BaseHTTPRequestHandler):
             }:
                 self.server.state.wait_for_runtime(timeout=WEB_RUNTIME_WAIT_TIMEOUT)
             with self.server.state.request_lock():
+                if (self._hidden_active_locked()
+                        and path not in {"/api/chats", "/auth/logout"}):
+                    self._send_json({"error": "Unlock hidden chats first."}, status=403)
+                    return
                 if path == "/auth/logout":
                     self._logout()
                 elif path == "/api/chats":
@@ -553,9 +582,24 @@ class LoaRequestHandler(BaseHTTPRequestHandler):
             for saved_session, expiry in list(self.server.state.sessions.items()):
                 if expiry <= now:
                     self.server.state.sessions.pop(saved_session, None)
+                    self.server.state.hidden_sessions.discard(saved_session)
                 elif hmac.compare_digest(session, saved_session):
                     return True
             return False
+
+    def _session_cookie(self) -> str:
+        for item in self.headers.get("Cookie", "").split(";"):
+            key, separator, value = item.strip().partition("=")
+            if separator and key == "loa_session":
+                return value
+        return ""
+
+    def _hidden_unlocked(self) -> bool:
+        return self._session_cookie() in self.server.state.hidden_sessions
+
+    def _hidden_active_locked(self) -> bool:
+        session = self.server.state.session
+        return bool(session and session["hidden"] and not self._hidden_unlocked())
 
     def _login(self, payload: dict[str, Any]) -> None:
         password = payload.get("password")
@@ -610,6 +654,7 @@ class LoaRequestHandler(BaseHTTPRequestHandler):
                 key, separator, value = item.strip().partition("=")
                 if key == "loa_session" and separator:
                     self.server.state.sessions.pop(value, None)
+                    self.server.state.hidden_sessions.discard(value)
         self._send_json({"ok": True}, clear_cookie=True)
 
     def _read_json(self, limit: int = MAX_REQUEST_BYTES) -> dict[str, Any]:
@@ -677,14 +722,13 @@ class LoaRequestHandler(BaseHTTPRequestHandler):
 
     def _save_settings(self, payload: dict[str, Any]) -> None:
         state = self.server.state
-        config = {
-            key: payload.get(key)
-            for key in ("name", "model", "prompt")
-        }
-        if any(not isinstance(value, str) or not value.strip() for value in config.values()):
-            raise ValueError(
-                "Name, model, and system prompt must not be empty."
-            )
+        if ("name" in payload and payload["name"] != DEFAULT_NAME) or (
+            "prompt" in payload and payload["prompt"] != DEFAULT_PROMPT
+        ):
+            raise ValueError("The assistant name and system prompt cannot be changed.")
+        model = payload.get("model")
+        if not isinstance(model, str) or not model.strip():
+            raise ValueError("Model must not be empty.")
         host_value = payload.get("ollama_host")
         if host_value is not None and not isinstance(host_value, str):
             raise ValueError("Ollama host URL must be text.")
@@ -733,9 +777,9 @@ class LoaRequestHandler(BaseHTTPRequestHandler):
             ),
         }
         assistant_config: AssistantConfig = {
-            "name": config["name"].strip(),
-            "model": config["model"].strip(),
-            "prompt": config["prompt"].strip(),
+            "name": DEFAULT_NAME,
+            "model": model.strip(),
+            "prompt": DEFAULT_PROMPT,
             "ollama_host": ollama_host,
             "image_gen": image_gen,
             "mcp_servers": payload.get(
@@ -761,7 +805,6 @@ class LoaRequestHandler(BaseHTTPRequestHandler):
             state.messages[0] = {
                 "role": "system",
                 "content": build_system_prompt(
-                    assistant_config["prompt"],
                     state.session["id"],
                     assistant_config["skill_states"],
                 ),
@@ -849,7 +892,6 @@ class LoaRequestHandler(BaseHTTPRequestHandler):
         configure_runtime_tools(state.config)
         if state.session is not None and state.messages and state.messages[0].get("role") == "system":
             state.messages[0]["content"] = build_system_prompt(
-                state.config["prompt"],
                 state.session["id"],
                 state.config.get("skill_states", {}),
             )
@@ -920,7 +962,6 @@ class LoaRequestHandler(BaseHTTPRequestHandler):
         state = self.server.state
         if state.session is not None and state.messages and state.messages[0].get("role") == "system":
             state.messages[0]["content"] = build_system_prompt(
-                state.config["prompt"],
                 state.session["id"],
                 state.config.get("skill_states", {}),
             )
@@ -985,9 +1026,39 @@ class LoaRequestHandler(BaseHTTPRequestHandler):
             "rename",
             "delete",
             "vectorize",
+            "set_pin",
+            "unlock",
+            "hide",
+            "unhide",
         }:
-            raise ValueError("Choose new, open, home, rename, delete, or vectorize for chat management.")
+            raise ValueError("Invalid chat management action.")
+        if operation == "set_pin":
+            pin = payload.get("pin")
+            if pin != payload.get("confirm_pin"):
+                raise ValueError("PINs do not match.")
+            set_hidden_chat_pin(pin)
+            self._send_json({"ok": True})
+            return
+        if operation == "unlock":
+            if not has_hidden_chat_pin():
+                raise ValueError("Hide a chat first to set up a PIN.")
+            client_ip = self.client_address[0]
+            now = time.monotonic()
+            attempts = [t for t in state.failed_pins.get(client_ip, []) if now - t < 900]
+            if len(attempts) >= 5:
+                self._send_json({"error": "Too many failed attempts. Wait 15 minutes and try again."}, status=429)
+                return
+            if not verify_hidden_chat_pin(payload.get("pin")):
+                attempts.append(now)
+                state.failed_pins[client_ip] = attempts
+                self._send_json({"error": "Incorrect PIN."}, status=401)
+                return
+            state.failed_pins.pop(client_ip, None)
+            state.hidden_sessions.add(self._session_cookie())
+            self._send_json({"ok": True})
+            return
         if operation == "home":
+            state.hidden_sessions.discard(self._session_cookie())
             self._deactivate_chat()
             self._send_json(
                 {
@@ -999,6 +1070,8 @@ class LoaRequestHandler(BaseHTTPRequestHandler):
                 }
             )
             return
+        if self._hidden_active_locked():
+            raise ValueError("Unlock hidden chats first.")
         if state.pending_action is not None:
             raise ValueError("Approve or cancel the pending action before managing chats.")
 
@@ -1009,8 +1082,22 @@ class LoaRequestHandler(BaseHTTPRequestHandler):
             chat_id = payload.get("chat_id")
             if not isinstance(chat_id, str):
                 raise ValueError("A chat id is required.")
+            target = load_chat_session(chat_id)
+            if target["hidden"] and not self._hidden_unlocked():
+                raise ValueError("Unlock hidden chats first.")
             if operation == "open":
-                self._activate_chat(load_chat_session(chat_id))
+                self._activate_chat(target)
+            elif operation in {"hide", "unhide"}:
+                if operation == "hide" and not has_hidden_chat_pin():
+                    raise ValueError("Set up a hidden chats PIN first.")
+                target["hidden"] = operation == "hide"
+                if state.session is not None and state.session["id"] == chat_id:
+                    state.session["hidden"] = target["hidden"]
+                    _save_active_chat(state)
+                    if target["hidden"]:
+                        self._deactivate_chat()
+                else:
+                    save_chat_session(target)
             elif operation == "rename":
                 title = payload.get("title")
                 if not isinstance(title, str):
@@ -1076,7 +1163,6 @@ class LoaRequestHandler(BaseHTTPRequestHandler):
         state.session = session
         state.messages = [message.copy() for message in session["messages"]]
         system_prompt = build_system_prompt(
-            state.config["prompt"],
             session["id"],
             state.config.get("skill_states", {}),
         )
@@ -1241,7 +1327,6 @@ class LoaRequestHandler(BaseHTTPRequestHandler):
             activate_skill_command(state.messages, skill)
         if state.messages and state.messages[0].get("role") == "system":
             state.messages[0]["content"] = build_system_prompt(
-                state.config["prompt"],
                 state.session["id"],
                 state.config.get("skill_states", {}),
             )

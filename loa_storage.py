@@ -1,8 +1,11 @@
 """Load and save LOA settings in the user's application config directory."""
 
 import json
+import hashlib
+import hmac
 import os
 import re
+import secrets
 import sys
 import uuid
 from copy import deepcopy
@@ -13,13 +16,13 @@ from typing import Any, TypedDict
 
 from loa_config import (
     AssistantConfig,
+    DEFAULT_NAME,
     DEFAULT_IMAGE_GEN_CONFIG,
     DEFAULT_COREML_SD_MODEL,
     DEFAULT_MCP_SERVERS,
     DEFAULT_PROMPT,
     IMAGE_GEN_PROVIDERS,
     default_ollama_host,
-    ensure_security_directive,
     is_valid_image_size,
 )
 
@@ -34,6 +37,7 @@ class ChatSession(TypedDict):
     summary: str
     keywords: list[str]
     messages: list[dict[str, Any]]
+    hidden: bool
 
 
 def config_file_path() -> Path:
@@ -95,20 +99,57 @@ def new_chat_session() -> ChatSession:
         "summary": "New conversation.",
         "keywords": [],
         "messages": [],
+        "hidden": False,
     }
 
 
-def list_chat_sessions() -> list[ChatSession]:
-    """Load saved chat sessions, newest first."""
+def list_chat_sessions(hidden: bool = False) -> list[ChatSession]:
+    """Load visible or hidden chat sessions, newest first."""
     directory = chats_directory_path()
     if not directory.exists():
         return []
     sessions = [
-        _load_chat_file(path)
+        session
         for path in directory.glob("*.json")
         if path.is_file()
+        if (session := _load_chat_file(path))["hidden"] == hidden
     ]
     return sorted(sessions, key=lambda chat: chat["updated_at"], reverse=True)
+
+
+def has_hidden_chat_pin() -> bool:
+    return (config_file_path().parent / "hidden_chat_pin.json").is_file()
+
+
+def set_hidden_chat_pin(pin: str) -> None:
+    if not isinstance(pin, str) or re.fullmatch(r"[0-9]{4,12}", pin) is None:
+        raise ValueError("PIN must contain 4 to 12 digits.")
+    if has_hidden_chat_pin():
+        raise ValueError("A hidden chats PIN is already configured.")
+    salt = secrets.token_bytes(16)
+    verifier = hashlib.scrypt(pin.encode(), salt=salt, n=2**14, r=8, p=1)
+    path = config_file_path().parent / "hidden_chat_pin.json"
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        _atomic_write_json(path, {"salt": salt.hex(), "verifier": verifier.hex()})
+    except OSError as error:
+        raise RuntimeError(f"Could not save the hidden chats PIN: {error}") from error
+
+
+def verify_hidden_chat_pin(pin: str) -> bool:
+    path = config_file_path().parent / "hidden_chat_pin.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        salt = bytes.fromhex(data["salt"])
+        expected = bytes.fromhex(data["verifier"])
+        if len(salt) != 16 or len(expected) != 64:
+            raise ValueError("Invalid PIN verifier.")
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        raise RuntimeError(f"Could not read the hidden chats PIN: {error}") from error
+    if not isinstance(pin, str) or re.fullmatch(r"[0-9]{4,12}", pin) is None:
+        return False
+    actual = hashlib.scrypt(pin.encode(), salt=salt, n=2**14, r=8, p=1)
+    return hmac.compare_digest(actual, expected)
 
 
 def load_chat_session(chat_id: str) -> ChatSession:
@@ -123,6 +164,7 @@ def save_chat_session(session: ChatSession) -> None:
     messages = session.get("messages")
     if not isinstance(messages, list):
         raise ValueError("Chat messages must be a list.")
+    session.setdefault("hidden", False)
 
     now = _timestamp()
     session["updated_at"] = now
@@ -165,6 +207,7 @@ def build_chat_catalog(active_chat_id: str | None = None, limit: int = 15) -> st
         entry
         for entry in _read_chat_index()
         if isinstance(entry.get("id"), str) and entry.get("id") != active_chat_id
+        and not entry.get("hidden", False)
     ]
     entries.sort(
         key=lambda entry: str(entry.get("updated_at", "")),
@@ -197,6 +240,8 @@ def recall_past_chat(
     if resolved_chat_id is None:
         return f"No saved chat matches '{chat_id}'."
     session = load_chat_session(resolved_chat_id)
+    if session["hidden"]:
+        return f"No saved chat matches '{chat_id}'."
     query_words = set(_keywords(query))
     candidates: list[tuple[int, int, str]] = []
     for position, message in enumerate(session["messages"]):
@@ -256,6 +301,7 @@ def _resolve_recall_chat_id(
         for entry in _read_chat_index()
         if isinstance(entry.get("id"), str)
         and entry.get("id") != exclude_chat_id
+        and not entry.get("hidden", False)
     ]
 
     if normalized_selector in {"latest", "newest"}:
@@ -361,6 +407,7 @@ def _load_chat_file(path: Path) -> ChatSession:
             if isinstance(keyword, str)
         ],
         "messages": data["messages"],
+        "hidden": data.get("hidden") is True,
     }
 
 
@@ -431,6 +478,7 @@ def find_saved_chat_id(chat_id: str) -> str | None:
             for entry in _read_chat_index()
             if isinstance(entry.get("id"), str)
             and entry["id"].casefold() == chat_id.casefold()
+            and not entry.get("hidden", False)
         ),
         None,
     )
@@ -443,6 +491,7 @@ def _update_chat_index(session: ChatSession) -> None:
         "updated_at": session["updated_at"],
         "summary": _compact_text(session["summary"], 15),
         "keywords": session["keywords"],
+        "hidden": session["hidden"],
     }
     entries = [
         existing
@@ -491,8 +540,7 @@ def load_config() -> AssistantConfig | None:
 
     if (
         not isinstance(data, dict)
-        or any(not isinstance(data.get(key), str) for key in ("name", "model"))
-        or ("prompt" in data and not isinstance(data["prompt"], str))
+        or not isinstance(data.get("model"), str)
     ):
         raise RuntimeError(
             f"LOA settings at {path} are invalid. Use /settings after startup to replace them."
@@ -506,9 +554,9 @@ def load_config() -> AssistantConfig | None:
         host_needs_save = True
 
     config: AssistantConfig = {
-        "name": data["name"],
+        "name": DEFAULT_NAME,
         "model": data["model"],
-        "prompt": data.get("prompt", ""),
+        "prompt": DEFAULT_PROMPT,
         "ollama_host": ollama_host,
         "image_gen": _normalize_image_gen_config(data.get("image_gen")),
         "mcp_servers": data.get("mcp_servers", deepcopy(DEFAULT_MCP_SERVERS)),
@@ -520,13 +568,9 @@ def load_config() -> AssistantConfig | None:
         or "image_gen" not in data
         or "mcp_servers" not in data
         or "skill_states" not in data
+        or data.get("name") != DEFAULT_NAME
+        or data.get("prompt") != DEFAULT_PROMPT
     )
-    if not config["prompt"].strip() or "NEVER call recall_past_chat" in config["prompt"]:
-        config["prompt"] = DEFAULT_PROMPT
-        needs_save = True
-    elif config["prompt"] != ensure_security_directive(config["prompt"]):
-        config["prompt"] = ensure_security_directive(config["prompt"])
-        needs_save = True
     if needs_save:
         save_config(config)
     return config
@@ -538,7 +582,8 @@ def save_config(config: AssistantConfig) -> None:
     host = config.get("ollama_host", "").strip()
     saved_config: AssistantConfig = {
         **config,
-        "prompt": ensure_security_directive(config.get("prompt", DEFAULT_PROMPT)),
+        "name": DEFAULT_NAME,
+        "prompt": DEFAULT_PROMPT,
         "ollama_host": host or default_ollama_host(),
         "image_gen": _normalize_image_gen_config(config.get("image_gen")),
         "mcp_servers": config.get("mcp_servers", deepcopy(DEFAULT_MCP_SERVERS)),

@@ -11,7 +11,7 @@ Build the standalone macOS executable:
 ./dist/loa
 ```
 
-The first launch asks for an assistant name, an Ollama model, and a system prompt. Settings are saved in the user's application support directory. Later launches open the chat directly; use **Settings** or `/settings` to edit them.
+The first launch asks for an Ollama model and connection settings. The assistant name is always LOA, and its base system prompt is fixed and identifies MexelRobi as its creator. Existing custom names and prompts are replaced with these fixed values; other settings are retained. Settings are saved in the user's application support directory. Later launches open the chat directly; use **Settings** or `/settings` to edit the remaining settings.
 
 ## MCP servers and user skills
 
@@ -55,6 +55,8 @@ LOA can inspect text files with `read_file` and can propose file creation or edi
 
 Chats are saved as JSON files under `~/Library/Application Support/LOA/chats`. LOA opens to a Home screen with **New Chat**, **Continue Last Chat**, and the five most recent conversations; opening Home does not create an empty chat. A chat is created only when you choose **New Chat** or send your first message. Use **Home** or `/home` to return at any time, and use **Chats**, `/chats`, or `/new` to manage and switch conversations. LOA keeps a compact local index of summaries and keywords and can retrieve a short relevant excerpt from a previous chat when asked; it does not add full old transcripts to the prompt.
 
+To hide a chat, select it in **Chats** and choose **Hide**. The first time, set and confirm a 4–12 digit PIN. Open **Hidden Chats** on Home and enter the PIN to view, open, or unhide those chats; returning Home locks the list again. Hidden chats are excluded from normal chat lists and past-chat recall. The PIN is stored as a salted verifier, but chat files and attachments are not encrypted; someone with access to the local files can still read them. Existing Brain memories are not removed when a chat is hidden. Keep the PIN safe: there is no PIN recovery in the app.
+
 ## Use the chat from a phone
 
 Start LOA's mobile web chat on your Mac:
@@ -83,6 +85,8 @@ The first run asks you to create the web password if one has not been set yet. T
 ```
 
 Use `--host`, `--port`, `--certfile`, and `--keyfile` when installing to customize the service. Service logs are saved under the LOA Application Support directory.
+
+When `mpkgexec` installs an update, it uses `launchctl` to stop an existing LOA LaunchAgent and re-register it afterward using its existing plist, preserving its executable path and service settings. An installed but unloaded agent is started after the update; if no agent exists, none is created. If the install fails after stopping a running agent, the script attempts to restore it. Because `mpkg` copies its payload before running `mpkgexec`, this stop happens after that initial copy, but before `mpkgexec` installs the downloaded release.
 
 ## Model memory use
 

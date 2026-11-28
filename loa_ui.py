@@ -56,6 +56,7 @@ from loa_agent import (
 from loa_config import (
     AssistantConfig,
     DEFAULT_COREML_SD_MODEL,
+    DEFAULT_NAME,
     DEFAULT_OLLAMA_HOST,
     DEFAULT_PROMPT,
     build_system_prompt,
@@ -70,6 +71,9 @@ from loa_storage import (
     rename_chat_session,
     save_chat_session,
     save_config,
+    has_hidden_chat_pin,
+    set_hidden_chat_pin,
+    verify_hidden_chat_pin,
 )
 from loa_brain import (
     add_brain_entry,
@@ -158,8 +162,7 @@ class SettingsScreen(Screen):
                     with TabbedContent(id="settings-tabs"):
                         with TabPane("General", id="general-settings"):
                             with VerticalScroll(classes="settings-tab-scroll"):
-                                yield Label("Assistant name:")
-                                yield Input(value=self.config["name"], id="ai_name")
+                                yield Label("Assistant: LOA")
                                 yield Label("Ollama model:")
                                 yield Input(value=self.config["model"], id="model_id")
                                 yield Label("Ollama Host URL:")
@@ -169,9 +172,6 @@ class SettingsScreen(Screen):
                                     id="ollama_host",
                                 )
                                 yield Button("Reset Host", id="reset_host")
-                                yield Label("System prompt:")
-                                yield TextArea(self.config["prompt"], id="system_prompt")
-                                yield Button("Reset Prompt", id="reset_prompt")
                         with TabPane("About Me", id="about-me-settings"):
                             with VerticalScroll(classes="settings-tab-scroll"):
                                 yield Label("Saved locally and included in LOA's context.")
@@ -385,12 +385,6 @@ class SettingsScreen(Screen):
                 self.app.exit()
             else:
                 self.app.pop_screen()
-            return
-        if event.button.id == "reset_prompt":
-            self.query_one("#system_prompt", TextArea).text = DEFAULT_PROMPT
-            self.query_one("#settings_error", Label).update(
-                "Default prompt restored. Save settings to keep it."
-            )
             return
         if event.button.id == "reset_host":
             self.query_one("#ollama_host", Input).value = DEFAULT_OLLAMA_HOST
@@ -626,17 +620,17 @@ class SettingsScreen(Screen):
             "quality": self.query_one("#image_gen_quality", Select).value,
         }
         config: AssistantConfig = {
-            "name": self.query_one("#ai_name", Input).value.strip(),
+            "name": DEFAULT_NAME,
             "model": self.query_one("#model_id", Input).value.strip(),
-            "prompt": self.query_one("#system_prompt", TextArea).text.strip(),
+            "prompt": DEFAULT_PROMPT,
             "ollama_host": self.query_one("#ollama_host", Input).value.strip(),
             "image_gen": image_gen,
             "mcp_servers": mcp_servers,
             "skill_states": skill_states,
         }
-        if not all(config[key] for key in ("name", "model", "prompt", "ollama_host")):
+        if not all(config[key] for key in ("model", "ollama_host")):
             self.query_one("#settings_error", Label).update(
-                "Name, model, Ollama host URL, and system prompt must not be empty."
+                "Model and Ollama host URL must not be empty."
             )
             return
 
@@ -806,6 +800,51 @@ def _relative_chat_time(timestamp: str) -> str:
     return updated.astimezone().strftime("%b %d")
 
 
+class HiddenPinScreen(ModalScreen[bool]):
+    def __init__(self, setup: bool = False) -> None:
+        super().__init__()
+        self.setup = setup
+
+    def compose(self) -> ComposeResult:
+        yield Container(
+            Vertical(
+                Label("Set up hidden chats PIN" if self.setup else "Unlock hidden chats", classes="title"),
+                Input(placeholder="PIN (4-12 digits)", password=True, id="hidden_pin"),
+                Input(placeholder="Confirm PIN", password=True, id="hidden_pin_confirm",
+                      disabled=not self.setup),
+                Label("", id="hidden_pin_error"),
+                Horizontal(Button("Continue", variant="primary", id="hidden_pin_submit"),
+                           Button("Cancel", id="hidden_pin_cancel"), classes="buttons"),
+                id="confirmation-container",
+            )
+        )
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "hidden_pin_cancel":
+            self.dismiss(False)
+        elif event.button.id == "hidden_pin_submit":
+            self._submit()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        if self.setup and event.input.id == "hidden_pin":
+            self.query_one("#hidden_pin_confirm", Input).focus()
+        else:
+            self._submit()
+
+    def _submit(self) -> None:
+        pin = self.query_one("#hidden_pin", Input).value
+        try:
+            if self.setup:
+                if pin != self.query_one("#hidden_pin_confirm", Input).value:
+                    raise ValueError("PINs do not match.")
+                set_hidden_chat_pin(pin)
+            elif not verify_hidden_chat_pin(pin):
+                raise ValueError("Incorrect PIN.")
+            self.dismiss(True)
+        except (OSError, RuntimeError, ValueError) as error:
+            self.query_one("#hidden_pin_error", Label).update(str(error))
+
+
 class StartScreen(Screen):
     """Welcome screen for starting or resuming a saved conversation."""
 
@@ -816,27 +855,32 @@ class StartScreen(Screen):
         self.load_error = ""
         self.refresh_sessions()
 
+    @staticmethod
+    def _recent_label(session: ChatSession) -> Text:
+        message_count = sum(
+            1
+            for message in session["messages"]
+            if message.get("role") in {"user", "assistant"}
+            and str(message.get("content") or "").strip()
+        )
+        preview = " ".join(str(session["summary"]).split())
+        return Text(
+            f"{session['title']}  |  {_relative_chat_time(session['updated_at'])}\n"
+            f"{message_count} messages  ·  {preview}",
+            overflow="fold",
+        )
+
     def _recent_rows(self) -> list[Button]:
         rows = []
-        for session in self.sessions:
-            message_count = sum(
-                1
-                for message in session["messages"]
-                if message.get("role") in {"user", "assistant"}
-                and str(message.get("content") or "").strip()
+        for index in range(5):
+            session = self.sessions[index] if index < len(self.sessions) else None
+            button = Button(
+                self._recent_label(session) if session else "",
+                id=f"home_chat_{index}",
+                classes="home-chat-choice",
             )
-            preview = " ".join(str(session["summary"]).split())
-            rows.append(
-                Button(
-                    Text(
-                        f"{session['title']}  |  {_relative_chat_time(session['updated_at'])}\n"
-                        f"{message_count} messages  ·  {preview}",
-                        overflow="fold",
-                    ),
-                    id=f"home_chat_{session['id']}",
-                    classes="home-chat-choice",
-                )
-            )
+            button.display = session is not None
+            rows.append(button)
         return rows
 
     def compose(self) -> ComposeResult:
@@ -855,6 +899,7 @@ class StartScreen(Screen):
                     disabled=not self.sessions,
                 ),
                 Button("Settings", id="home_settings"),
+                Button("Hidden Chats", id="home_hidden_chats"),
                 Button("Exit", id="home_exit"),
                 classes="buttons",
             ),
@@ -879,11 +924,12 @@ class StartScreen(Screen):
             self.sessions = []
             self.load_error = str(error)
         if self.is_mounted:
-            recent = self.query_one("#home_recent_chats", VerticalScroll)
-            recent.remove_children()
-            rows = self._recent_rows()
-            if rows:
-                recent.mount(*rows)
+            for index in range(5):
+                button = self.query_one(f"#home_chat_{index}", Button)
+                session = self.sessions[index] if index < len(self.sessions) else None
+                button.display = session is not None
+                if session is not None:
+                    button.label = self._recent_label(session)
             self.query_one("#home_continue_chat", Button).disabled = not self.sessions
             self.query_one("#home_empty", Label).update(
                 "No saved conversations yet." if not self.sessions else ""
@@ -895,7 +941,10 @@ class StartScreen(Screen):
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id.startswith("home_chat_"):
-            chat_id = event.button.id.removeprefix("home_chat_")
+            index = int(event.button.id.removeprefix("home_chat_"))
+            if index >= len(self.sessions):
+                return
+            chat_id = self.sessions[index]["id"]
             try:
                 self._open_session(load_chat_session(chat_id))
             except (OSError, RuntimeError, ValueError) as error:
@@ -919,6 +968,14 @@ class StartScreen(Screen):
                     self.refresh_sessions()
         elif event.button.id == "home_settings":
             self.app.push_screen(SettingsScreen(self.config))
+        elif event.button.id == "home_hidden_chats":
+            if not has_hidden_chat_pin():
+                self.query_one("#home_status", Label).update("Hide a chat first to set up a PIN.")
+            else:
+                self.app.push_screen(
+                    HiddenPinScreen(),
+                    lambda unlocked: self.app.push_screen(ChatManagerScreen(hidden=True)) if unlocked else None,
+                )
         elif event.button.id == "home_exit":
             self.app.exit()
 
@@ -926,10 +983,11 @@ class StartScreen(Screen):
 class ChatManagerScreen(ModalScreen[None]):
     """List saved chats and expose switching and maintenance actions."""
 
-    def __init__(self) -> None:
+    def __init__(self, hidden: bool = False) -> None:
         super().__init__()
+        self.hidden = hidden
         try:
-            self.sessions = list_chat_sessions()
+            self.sessions = list_chat_sessions(hidden=hidden)
             self.load_error = ""
         except (OSError, RuntimeError, ValueError) as error:
             self.sessions = []
@@ -951,15 +1009,19 @@ class ChatManagerScreen(ModalScreen[None]):
         ]
         yield Container(
             Vertical(
-                Label("Chats", classes="title"),
+                Label("Hidden Chats" if self.hidden else "Chats", classes="title"),
                 Label(self.load_error, id="chat_manager_error"),
                 Input(placeholder="Search chats", id="chat_search"),
                 ListView(*rows, id="saved_chats"),
                 Input(placeholder="Title for Rename", id="chat_title"),
                 Horizontal(
                     Button("Open / Switch", variant="primary", id="open_chat"),
-                    Button("New Chat", id="new_chat"),
+                    Button("New Chat", id="new_chat", disabled=self.hidden),
                     Button("Rename", id="rename_chat"),
+                    Button("Unhide" if self.hidden else "Hide", id="toggle_hidden_chat"),
+                    classes="buttons",
+                ),
+                Horizontal(
                     Button("Vectorize and delete", id="vectorize_chat"),
                     Button("Delete", variant="error", id="delete_chat"),
                     Button("Close", id="close_chat_manager"),
@@ -983,6 +1045,8 @@ class ChatManagerScreen(ModalScreen[None]):
             if isinstance(app.screen, ChatScreen):
                 app.screen.load_session(session)
                 app.screen._save_chat()
+            elif isinstance(app.screen, StartScreen):
+                app.screen._open_session(session)
             return
 
         list_view = self.query_one("#saved_chats", ListView)
@@ -999,6 +1063,16 @@ class ChatManagerScreen(ModalScreen[None]):
                 app.pop_screen()
                 if isinstance(app.screen, ChatScreen):
                     app.screen.load_session(loaded)
+                elif isinstance(app.screen, StartScreen):
+                    app.screen._open_session(loaded)
+            elif event.button.id == "toggle_hidden_chat":
+                if not self.hidden and not has_hidden_chat_pin():
+                    app.push_screen(
+                        HiddenPinScreen(setup=True),
+                        lambda confirmed: self._set_hidden(session["id"]) if confirmed else None,
+                    )
+                else:
+                    self._set_hidden(session["id"])
             elif event.button.id == "rename_chat":
                 title = self.query_one("#chat_title", Input).value
                 renamed = rename_chat_session(session["id"], title)
@@ -1009,7 +1083,7 @@ class ChatManagerScreen(ModalScreen[None]):
                 ):
                     app.screen.session["title"] = renamed["title"]
                     app.screen._save_chat()
-                app.push_screen(ChatManagerScreen())
+                app.push_screen(ChatManagerScreen(hidden=self.hidden))
             elif event.button.id == "delete_chat":
                 delete_chat_session(session["id"])
                 app.pop_screen()
@@ -1018,7 +1092,7 @@ class ChatManagerScreen(ModalScreen[None]):
                         app.pop_screen()
                 if isinstance(app.screen, StartScreen):
                     app.screen.refresh_sessions()
-                app.push_screen(ChatManagerScreen())
+                app.push_screen(ChatManagerScreen(hidden=self.hidden))
             elif event.button.id == "vectorize_chat":
                 app.push_screen(
                     ConfirmationScreen(
@@ -1062,6 +1136,23 @@ class ChatManagerScreen(ModalScreen[None]):
         )
         return chat_screen.session["id"] if chat_screen is not None else None
 
+    def _set_hidden(self, chat_id: str) -> None:
+        app = self.app
+        try:
+            session = load_chat_session(chat_id)
+            session["hidden"] = not self.hidden
+            save_chat_session(session)
+            app.pop_screen()
+            if isinstance(app.screen, ChatScreen) and app.screen.session["id"] == chat_id:
+                app.screen.session["hidden"] = session["hidden"]
+                if session["hidden"]:
+                    app.pop_screen()
+            if isinstance(app.screen, StartScreen):
+                app.screen.refresh_sessions()
+            app.push_screen(ChatManagerScreen(hidden=self.hidden))
+        except (OSError, RuntimeError, ValueError) as error:
+            self.query_one("#chat_manager_error", Label).update(str(error))
+
     def _vectorize(self, chat_id: str) -> None:
         app = self.app
         if not isinstance(app, LoaApp):
@@ -1080,7 +1171,7 @@ class ChatManagerScreen(ModalScreen[None]):
                 app.pop_screen()
             if isinstance(app.screen, StartScreen):
                 app.screen.refresh_sessions()
-            manager = ChatManagerScreen()
+            manager = ChatManagerScreen(hidden=self.hidden)
             manager.load_error = (
                 f"Saved {len(memories)} local Brain entries; raw chat deleted."
             )
@@ -1184,7 +1275,7 @@ class ChatScreen(Screen):
         elif event.button.id == "open_settings":
             self._open_settings()
         elif event.button.id == "open_chats":
-            self.app.push_screen(ChatManagerScreen())
+            self.app.push_screen(ChatManagerScreen(hidden=self.session["hidden"]))
         elif event.button.id == "home":
             self._go_home()
         elif event.button.id == "exit_chat":
@@ -1215,7 +1306,7 @@ class ChatScreen(Screen):
             self._go_home()
             return
         if text.lower() == "/chats":
-            self.app.push_screen(ChatManagerScreen())
+            self.app.push_screen(ChatManagerScreen(hidden=self.session["hidden"]))
             return
         if text.lower() == "/mcp":
             self._write("Manage MCP servers in Settings > MCP Servers.")
@@ -1530,7 +1621,6 @@ class ChatScreen(Screen):
 
     def _system_prompt(self) -> str:
         return build_system_prompt(
-            self.config["prompt"],
             self.session["id"],
             self.config.get("skill_states", {}),
         )
