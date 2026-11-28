@@ -30,7 +30,7 @@ launchctl_for_user() {
     if [ "$(id -u)" = "0" ]; then
         "$LAUNCHCTL" asuser "$SERVICE_UID" sudo -u "$SERVICE_USER" "$LAUNCHCTL" "$@"
     else
-        "$LAUNCHCTL" "$@"
+        sudo "$LAUNCHCTL" "$@"
     fi
 }
 

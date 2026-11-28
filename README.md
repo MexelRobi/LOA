@@ -86,7 +86,7 @@ The first run asks you to create the web password if one has not been set yet. T
 
 Use `--host`, `--port`, `--certfile`, and `--keyfile` when installing to customize the service. Service logs are saved under the LOA Application Support directory.
 
-When `mpkgexec` installs an update, it uses `launchctl` to stop an existing LOA LaunchAgent and re-register it afterward using its existing plist, preserving its executable path and service settings. An installed but unloaded agent is started after the update; if no agent exists, none is created. If the install fails after stopping a running agent, the script attempts to restore it. Because `mpkg` copies its payload before running `mpkgexec`, this stop happens after that initial copy, but before `mpkgexec` installs the downloaded release.
+When `mpkgexec` installs an update, it uses `sudo` to run `launchctl` when needed to stop an existing LOA LaunchAgent and re-register it afterward using its existing plist, preserving its executable path and service settings. An installed but unloaded agent is started after the update; if no agent exists, none is created. If the install fails after stopping a running agent, the script attempts to restore it. Because `mpkg` copies its payload before running `mpkgexec`, this stop happens after that initial copy, but before `mpkgexec` installs the downloaded release.
 
 ## Model memory use
 

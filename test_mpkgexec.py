@@ -117,6 +117,7 @@ esac
         self.assertEqual(result.returncode, 0, result.stderr)
         log = self.log.read_text()
         self.assertNotIn("launchctl bootout", log)
+        self.assertIn(f"sudo {self.bin / 'launchctl'} bootstrap gui/501", log)
         self.assertIn("launchctl bootstrap", log)
 
     def test_failed_install_restores_previously_loaded_agent(self):
