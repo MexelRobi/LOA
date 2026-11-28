@@ -158,6 +158,7 @@ esac
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Could not register", result.stderr)
         self.assertIn("Could not restore", result.stderr)
+        self.assertIn(f"Run sudo {self.bin / 'launchctl'} bootstrap gui/501", result.stderr)
 
     def test_root_uses_sudo_users_gui_domain(self):
         self.install_plist()

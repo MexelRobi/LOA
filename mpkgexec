@@ -41,7 +41,7 @@ cleanup() {
     if [ "$RESTART_SERVICE" = "1" ]; then
         echo "-> Restoring the previously running LOA LaunchAgent..."
         if ! launchctl_for_user bootstrap "$SERVICE_DOMAIN" "$SERVICE_PLIST"; then
-            echo "[ERROR] Could not restore the LOA LaunchAgent. Run launchctl bootstrap $SERVICE_DOMAIN \"$SERVICE_PLIST\" as $SERVICE_USER." >&2
+            echo "[ERROR] Could not restore the LOA LaunchAgent. Run sudo $LAUNCHCTL bootstrap $SERVICE_DOMAIN \"$SERVICE_PLIST\" as $SERVICE_USER." >&2
             status=1
         fi
     fi
